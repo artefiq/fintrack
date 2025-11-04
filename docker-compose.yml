@@ -1,0 +1,105 @@
+version: '3.9'
+
+services:
+  # # User Service
+  # user-service:
+  #   build: ./user_service
+  #   container_name: user_service
+  #   ports:
+  #     - "7071:80"
+  #   environment:
+  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
+  #     - FUNCTIONS_WORKER_RUNTIME=python
+  #     - SQL_CONN_STRING=${AZURE_SQL_CONN}
+  #   volumes:
+  #     - ./user_service:/home/site/wwwroot
+
+  # # Transaction Service
+  # transaction-service:
+  #   build: ./transaction_service
+  #   container_name: transaction_service
+  #   ports:
+  #     - "7072:80"
+  #   environment:
+  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
+  #     - FUNCTIONS_WORKER_RUNTIME=python
+  #     - SQL_CONN_STRING=${AZURE_SQL_CONN}
+  #     - SERVICE_BUS_CONN=${SERVICE_BUS_CONN}
+  #   volumes:
+  #     - ./transaction_service:/home/site/wwwroot
+
+  # # Category (AI Categorizer) Service
+  # category-service:
+  #   build: ./category_service
+  #   container_name: category_service
+  #   ports:
+  #     - "7073:80"
+  #   environment:
+  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
+  #     - FUNCTIONS_WORKER_RUNTIME=python
+  #     - SERVICE_BUS_CONN=${SERVICE_BUS_CONN}
+  #     - COGNITIVE_KEY=${AZURE_AI_KEY}
+  #     - COGNITIVE_ENDPOINT=${AZURE_AI_ENDPOINT}
+  #   volumes:
+  #     - ./category_service:/home/site/wwwroot
+
+  # # Report Service
+  # report-service:
+  #   build: ./report_service
+  #   container_name: report_service
+  #   ports:
+  #     - "7074:80"
+  #   environment:
+  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
+  #     - FUNCTIONS_WORKER_RUNTIME=python
+  #     - SQL_CONN_STRING=${AZURE_SQL_CONN}
+  #   volumes:
+  #     - ./report_service:/home/site/wwwroot
+
+  # # AI Service (Chatbot)
+  # ai-service:
+  #   build: ./ai_service
+  #   container_name: ai_service
+  #   ports:
+  #     - "7075:80"
+  #   environment:
+  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
+  #     - FUNCTIONS_WORKER_RUNTIME=python
+  #     - OPENAI_KEY=${AZURE_OPENAI_KEY}
+  #     - OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+  #   volumes:
+  #     - ./ai_service:/home/site/wwwroot
+
+  # # API Gateway (HTTP Trigger)
+  # api-gateway:
+  #   build: ./api_gateway
+  #   container_name: api_gateway
+  #   ports:
+  #     - "8080:80"
+  #   environment:
+  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
+  #     - FUNCTIONS_WORKER_RUNTIME=python
+  #     - GATEWAY_MODE=LOCAL
+  #   volumes:
+  #     - ./api_gateway:/home/site/wwwroot
+  #   depends_on:
+  #     - user-service
+  #     - transaction-service
+  #     - category-service
+  #     - report-service
+  #     - ai-service
+
+  # Local SQL
+  db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: azure_sql_local
+    ports:
+      - "1433:1433"
+    environment:
+      SA_PASSWORD: "fintr4ck"
+      ACCEPT_EULA: "Y"
+    volumes:
+      - sql_data:/var/opt/mssql
+
+volumes:
+  sql_data:
