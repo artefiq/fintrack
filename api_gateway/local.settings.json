@@ -1,12 +1,12 @@
 {
   "IsEncrypted": false,
   "Values": {
-    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "AzureWebJobsStorage": "",
     "FUNCTIONS_WORKER_RUNTIME": "python",
-    "USER_SERVICE_URL": "http://localhost:7072",
-    "TRANSACTION_SERVICE_URL": "http://localhost:7073",
-    "CATEGORY_SERVICE_URL": "http://localhost:7074",
-    "REPORT_SERVICE_URL": "http://localhost:7075",
-    "AI_SERVICE_URL": "http://localhost:7076"
+    "USER_SERVICE_URL": "https://httpbin.org/anything",
+    "TRANSACTION_SERVICE_URL": "https://httpbin.org/anything",
+    "CATEGORY_SERVICE_URL": "https://httpbin.org/anything",
+    "REPORT_SERVICE_URL": "https://httpbin.org/anything",
+    "AI_SERVICE_URL": "https://httpbin.org/anything"
   }
 }
