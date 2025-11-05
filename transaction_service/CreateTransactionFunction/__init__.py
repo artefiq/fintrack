@@ -37,12 +37,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "PartitionKey": "transaction",
             "RowKey": str(datetime.utcnow().timestamp()).replace('.', ''),
             "user_id": data["user_id"],
-            "category_id": data.get("category_id", 0),
-            "amount": float(data["amount"]),
-            "description": data.get("description", ""),
+            "category_id": 0,                             # <-- DEFAULT: UNCATEGORIZED
+            # "amount": float(data.get("amount", 0.0)),     # <-- DEFAULT: 0.0 (Jika amount tidak ada di request)
+            "amount": 0.0,     
+            "description": data["description"],           # <-- Input wajib dari user (e.g., "5k beli air")
             "transaction_date": datetime.utcnow().isoformat(),
             "source": data.get("source", "unknown"),
-            "ai_confidence": data.get("ai_confidence", "0.0"),
+            "ai_confidence": "0.0",
             "input_type": data.get("input_type", "text")
         }
 

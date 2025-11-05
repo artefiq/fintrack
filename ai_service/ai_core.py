@@ -46,7 +46,7 @@ def process_ai_request(text_input: str, ai_instruction: dict) -> dict:
     prompt_text = (
         f"Tugas: {system_prompt}\n\n"
         f"Kategorikan transaksi ini: '{text_input}'. "
-        f"Kembalikan respons HANYA dalam format JSON dengan kunci 'category' (string) dan 'confidence' (float)."
+        f"Kembalikan respons HANYA dalam format JSON dengan kunci 'category' (string), 'amount' (float), dan 'confidence' (float)."
     )
     
     try:
