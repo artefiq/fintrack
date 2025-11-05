@@ -1,0 +1,12 @@
+[
+  {
+    "id": "event-palsu-456",
+    "eventType": "Month.Ended",
+    "subject": "Month/Ended",
+    "dataVersion": "1.0",
+    "data": {
+      "month": "2025-10"
+    },
+    "eventTime": "2025-11-05T18:35:00Z"
+  }
+]

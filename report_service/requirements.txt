@@ -1,5 +1,6 @@
 azure-functions
 azure-eventgrid
-azure-core
+azure-functions-durable
+azure-data-tables
 pyodbc
 requests

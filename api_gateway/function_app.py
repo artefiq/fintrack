@@ -5,7 +5,6 @@ import json
 
 app = func.FunctionApp()  # Definisikan app V2
 
-# Ini menggantikan file function.json
 @app.route(route="gateway/{*path}", methods=["GET", "POST", "PUT", "DELETE"])
 def gateway(req: func.HttpRequest) -> func.HttpResponse:
     try:
@@ -29,8 +28,6 @@ def gateway(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json",
                 status_code=404
             )
-
-        # --- PERUBAHAN DIMULAI DI SINI ---
         
         # 1. Buat dictionary header baru, filter 'host' agar tidak bocor
         fwd_headers = {key: value for (key, value) in req.headers.items() if key.lower() != 'host'}
@@ -43,8 +40,6 @@ def gateway(req: func.HttpRequest) -> func.HttpResponse:
             data=req.get_body()
         )
         
-        # --- PERUBAHAN SELESAI ---
-
         return func.HttpResponse(
             resp.text,
             mimetype="application/json",

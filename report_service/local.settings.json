@@ -3,11 +3,13 @@
   "Values": {
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "python",
-    "DB_SERVER": "tcp:fintrack-sql.database.windows.net,1433",
-    "DB_NAME": "fintrack_db",
-    "DB_USER": "admin_user",
-    "DB_PASSWORD": "YourStrongPassword123!",
-    "EVENTGRID_TOPIC_ENDPOINT": "https://your-eventgrid-topic.westeurope-1.eventgrid.azure.net/api/events",
-    "EVENTGRID_ACCESS_KEY": "YourEventGridKey"
+    
+    "AZURITE_TABLE_CONN_STR": "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;",
+
+    "EVENTGRID_TOPIC_ENDPOINT": "http://your-eventgrid-topic.example.com",
+    "EVENTGRID_ACCESS_KEY": "dummy-key-for-local-demo",
+
+    "IS_LOCAL_DEMO": "true"
   }
 }
+

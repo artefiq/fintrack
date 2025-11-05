@@ -1,9 +1,11 @@
 {
   "IsEncrypted": false,
   "Values": {
-    "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "EVENT_GRID_TOPIC_ENDPOINT": "https://<your-event-grid-topic>.<region>-1.eventgrid.azure.net/api/events",
-    "EVENT_GRID_KEY": "<your-event-grid-access-key>"
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "B2C_TENANT_NAME": "your-tenant-name",
+    "B2C_USER_FLOW": "B2C_1_signupsignin1",
+    "B2C_CLIENT_ID": "your-app-client-id"
   }
 }
