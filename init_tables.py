@@ -64,7 +64,8 @@ transaction_table.create_entity({
     "description": "Beli kopi",
     "transaction_date": datetime.utcnow().isoformat(),
     "source": "cash",
-    "ai_confidence": "0.92"
+    "ai_confidence": "0.92",
+    "input_type": "text"  # transaksi manual
 })
 transaction_table.create_entity({
     "PartitionKey": "transaction",
@@ -75,7 +76,8 @@ transaction_table.create_entity({
     "description": "Gaji Bulanan",
     "transaction_date": datetime.utcnow().isoformat(),
     "source": "transfer",
-    "ai_confidence": "0.98"
+    "ai_confidence": "0.98",
+    "input_type": "text"  # transaksi manual
 })
 print("Transaction ditambahkan.")
 
@@ -107,4 +109,4 @@ report_table.create_entity({
 })
 print("Report ditambahkan.")
 
-print("all done")
+print("Semua data selesai ditambahkan")

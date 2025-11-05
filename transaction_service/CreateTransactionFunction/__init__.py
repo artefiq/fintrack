@@ -8,18 +8,31 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
         data = req.get_json()
 
-        # Koneksi ke Azurite
-        connection_string = (
+        # Connection String (Azurite)
+        table_conn_str = (
             "DefaultEndpointsProtocol=http;"
             "AccountName=devstoreaccount1;"
             "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
             "TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;"
         )
 
-        table_service = TableServiceClient.from_connection_string(connection_string)
-        transaction_table = table_service.get_table_client("transaction")
+        queue_conn_str = (
+            "DefaultEndpointsProtocol=http;"
+            "AccountName=devstoreaccount1;"
+            "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
+            "QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;"
+        )
 
-        # Simpan ke tabel
+        # Table Service
+        table_service = TableServiceClient.from_connection_string(table_conn_str)
+        table_client = table_service.get_table_client("transaction")
+
+        try:
+            table_service.create_table_if_not_exists("transaction")
+        except Exception:
+            pass  # tabel sudah ada
+
+        # Entity
         entity = {
             "PartitionKey": "transaction",
             "RowKey": str(datetime.utcnow().timestamp()).replace('.', ''),
@@ -29,20 +42,29 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "description": data.get("description", ""),
             "transaction_date": datetime.utcnow().isoformat(),
             "source": data.get("source", "unknown"),
-            "ai_confidence": "0.0"
+            "ai_confidence": data.get("ai_confidence", "0.0"),
+            "input_type": data.get("input_type", "text")
         }
 
-        transaction_table.create_entity(entity=entity)
+        table_client.create_entity(entity=entity)
 
-        # Publish event ke Queue Transaction.Created
+        # Queue Service
         queue_client = QueueClient.from_connection_string(
-            conn_str=connection_string.replace("TableEndpoint", "QueueEndpoint").replace("10002", "10001"),
+            conn_str=queue_conn_str,
             queue_name="transaction-created"
         )
-        queue_client.create_queue()
+
+        try:
+            queue_client.create_queue()
+        except Exception:
+            pass  # queue sudah ada
+
         queue_client.send_message(json.dumps(entity))
 
-        return func.HttpResponse("Transaction created and event published.", status_code=200)
+        return func.HttpResponse(
+            "Transaction created and event published.",
+            status_code=200
+        )
 
     except Exception as e:
-        return func.HttpResponse(str(e), status_code=500)
+        return func.HttpResponse(f"❌ Error: {str(e)}", status_code=500)
