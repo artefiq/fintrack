@@ -107,4 +107,4 @@ report_table.create_entity({
 })
 print("Report ditambahkan.")
 
-print("\nSemua tabel dan data contoh berhasil dibuat di Azurite!")
+print("all done")
