@@ -1,105 +1,97 @@
-version: '3.9'
+version: '3.8'
 
 services:
-  # # User Service
-  # user-service:
-  #   build: ./user_service
-  #   container_name: user_service
-  #   ports:
-  #     - "7071:80"
-  #   environment:
-  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
-  #     - FUNCTIONS_WORKER_RUNTIME=python
-  #     - SQL_CONN_STRING=${AZURE_SQL_CONN}
-  #   volumes:
-  #     - ./user_service:/home/site/wwwroot
-
-  # # Transaction Service
-  # transaction-service:
-  #   build: ./transaction_service
-  #   container_name: transaction_service
-  #   ports:
-  #     - "7072:80"
-  #   environment:
-  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
-  #     - FUNCTIONS_WORKER_RUNTIME=python
-  #     - SQL_CONN_STRING=${AZURE_SQL_CONN}
-  #     - SERVICE_BUS_CONN=${SERVICE_BUS_CONN}
-  #   volumes:
-  #     - ./transaction_service:/home/site/wwwroot
-
-  # # Category (AI Categorizer) Service
-  # category-service:
-  #   build: ./category_service
-  #   container_name: category_service
-  #   ports:
-  #     - "7073:80"
-  #   environment:
-  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
-  #     - FUNCTIONS_WORKER_RUNTIME=python
-  #     - SERVICE_BUS_CONN=${SERVICE_BUS_CONN}
-  #     - COGNITIVE_KEY=${AZURE_AI_KEY}
-  #     - COGNITIVE_ENDPOINT=${AZURE_AI_ENDPOINT}
-  #   volumes:
-  #     - ./category_service:/home/site/wwwroot
-
-  # # Report Service
-  # report-service:
-  #   build: ./report_service
-  #   container_name: report_service
-  #   ports:
-  #     - "7074:80"
-  #   environment:
-  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
-  #     - FUNCTIONS_WORKER_RUNTIME=python
-  #     - SQL_CONN_STRING=${AZURE_SQL_CONN}
-  #   volumes:
-  #     - ./report_service:/home/site/wwwroot
-
-  # # AI Service (Chatbot)
-  # ai-service:
-  #   build: ./ai_service
-  #   container_name: ai_service
-  #   ports:
-  #     - "7075:80"
-  #   environment:
-  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
-  #     - FUNCTIONS_WORKER_RUNTIME=python
-  #     - OPENAI_KEY=${AZURE_OPENAI_KEY}
-  #     - OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
-  #   volumes:
-  #     - ./ai_service:/home/site/wwwroot
-
-  # # API Gateway (HTTP Trigger)
-  # api-gateway:
-  #   build: ./api_gateway
-  #   container_name: api_gateway
-  #   ports:
-  #     - "8080:80"
-  #   environment:
-  #     - AzureWebJobsStorage=${AZURE_STORAGE_CONN}
-  #     - FUNCTIONS_WORKER_RUNTIME=python
-  #     - GATEWAY_MODE=LOCAL
-  #   volumes:
-  #     - ./api_gateway:/home/site/wwwroot
-  #   depends_on:
-  #     - user-service
-  #     - transaction-service
-  #     - category-service
-  #     - report-service
-  #     - ai-service
-
-  # Local SQL
-  db:
-    image: mcr.microsoft.com/mssql/server:2022-latest
-    container_name: azure_sql_local
+  # 1. Database Emulator (Azurite)
+  # Menangani Blob (Timer), Queue (Messaging), dan Table (Database)
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    container_name: azurite_storage
     ports:
-      - "1433:1433"
+      - "10000:10000" # Blob
+      - "10001:10001" # Queue
+      - "10002:10002" # Table
     environment:
-      SA_PASSWORD: "fintr4ck"
-      ACCEPT_EULA: "Y"
-    volumes:
-      - sql_data:/var/opt/mssql
+      - AZURITE_ACCOUNTS=devstoreaccount1:Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
 
-volumes:
-  sql_data:
+  # 2. API Gateway (Satu-satunya Pintu Masuk)
+  # Port 7071 di Mac Anda -> Port 80 di Container ini
+  api_gateway:
+    build: ./api_gateway
+    container_name: api_gateway
+    ports:
+      - "7071:80" 
+    env_file:
+      - ./.env
+    environment:
+      # Routing internal ke service lain (menggunakan nama service docker)
+      # Perhatikan port 80, karena image Azure Function default jalan di port 80
+      USER_SERVICE_URL: "http://user_service:80/api"
+      TRANSACTION_SERVICE_URL: "http://transaction_service:80/api"
+      REPORT_SERVICE_URL: "http://report_service:80/api"
+      AI_SERVICE_ENDPOINT: "http://ai_service:80/api/ai/language" # Opsional jika gateway butuh akses langsung
+    depends_on:
+      - user_service
+      - transaction_service
+      - report_service
+
+  # 3. User Service (Backend - Internal Only)
+  user_service:
+    build: ./user_service
+    container_name: user_service
+    env_file:
+      - ./.env
+    # Tidak perlu 'ports', tersembunyi di dalam network Docker
+
+  # 4. Transaction Service (Input Data & Queue Publisher)
+  transaction_service:
+    build: ./transaction_service
+    container_name: transaction_service
+    env_file:
+      - ./.env
+    environment:
+      # Koneksi ke Azurite (menggunakan nama host 'azurite')
+      AZURITE_CONN_STR: ${AZURITE_CONN_STR_DOCKER}
+    depends_on:
+      - azurite
+
+  # 5. Category Service (Queue Consumer & AI Caller)
+  category_service:
+    build: ./category_service
+    container_name: category_service
+    env_file:
+      - ./.env
+    environment:
+      AZURITE_CONN_STR: ${AZURITE_CONN_STR_DOCKER}
+      # Memanggil AI Service secara internal
+      AI_SERVICE_ENDPOINT: "http://ai_service:80/api/ai/language"
+    depends_on:
+      - azurite
+      - ai_service
+
+  # 6. Report Service (Timer & Event Subscriber)
+  report_service:
+    build: ./report_service
+    container_name: report_service
+    env_file:
+      - ./.env
+    environment:
+      AZURITE_TABLE_CONN_STR: ${AZURITE_CONN_STR_DOCKER}
+      # AzureWebJobsStorage dibutuhkan untuk TimerTrigger (State management)
+      AzureWebJobsStorage: ${AZURITE_CONN_STR_DOCKER} 
+      IS_LOCAL_DEMO: "true"
+    depends_on:
+      - azurite
+
+  # 7. AI Service (Intelligence Provider)
+  ai_service:
+    build: ./ai_service
+    container_name: ai_service
+    env_file:
+      - ./.env
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+
+# Network default agar semua container bisa saling ping dengan nama service
+networks:
+  default:
+    driver: bridge
