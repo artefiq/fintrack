@@ -48,3 +48,4 @@ __queuestorage__
 __azurite_db*__.json
 
 .vscode
+event_report_req.json

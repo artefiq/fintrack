@@ -4,3 +4,6 @@ azure-functions-durable
 azure-data-tables
 pyodbc
 requests
+pandas
+openpyxl
+azure-storage-blob

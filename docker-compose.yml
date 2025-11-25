@@ -10,12 +10,13 @@ services:
       - "10000:10000" # Blob
       - "10001:10001" # Queue
       - "10002:10002" # Table
-    environment:
-      - AZURITE_ACCOUNTS=devstoreaccount1:Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+    # environment:
+    #   - AZURITE_ACCOUNTS=devstoreaccount1:Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
 
   # 2. API Gateway (Satu-satunya Pintu Masuk)
   # Port 7071 di Mac Anda -> Port 80 di Container ini
   api_gateway:
+    platform: linux/amd64
     build: ./api_gateway
     container_name: api_gateway
     ports:
@@ -29,6 +30,11 @@ services:
       TRANSACTION_SERVICE_URL: "http://transaction_service:80/api"
       REPORT_SERVICE_URL: "http://report_service:80/api"
       AI_SERVICE_ENDPOINT: "http://ai_service:80/api/ai/language" # Opsional jika gateway butuh akses langsung
+
+      IS_LOCAL_DEMO: "true"
+      EVENTGRID_TOPIC_ENDPOINT: "http://dummy.endpoint" 
+      EVENTGRID_ACCESS_KEY: "dummy-key"
+
     depends_on:
       - user_service
       - transaction_service
@@ -36,6 +42,7 @@ services:
 
   # 3. User Service (Backend - Internal Only)
   user_service:
+    platform: linux/amd64
     build: ./user_service
     container_name: user_service
     env_file:
@@ -44,6 +51,7 @@ services:
 
   # 4. Transaction Service (Input Data & Queue Publisher)
   transaction_service:
+    platform: linux/amd64
     build: ./transaction_service
     container_name: transaction_service
     env_file:
@@ -56,6 +64,7 @@ services:
 
   # 5. Category Service (Queue Consumer & AI Caller)
   category_service:
+    platform: linux/amd64
     build: ./category_service
     container_name: category_service
     env_file:
@@ -70,8 +79,11 @@ services:
 
   # 6. Report Service (Timer & Event Subscriber)
   report_service:
+    platform: linux/amd64
     build: ./report_service
     container_name: report_service
+    ports:
+      - "7072:80"
     env_file:
       - ./.env
     environment:
@@ -84,6 +96,7 @@ services:
 
   # 7. AI Service (Intelligence Provider)
   ai_service:
+    platform: linux/amd64
     build: ./ai_service
     container_name: ai_service
     env_file:

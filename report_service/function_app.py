@@ -7,6 +7,9 @@ from datetime import datetime
 from azure.eventgrid import EventGridPublisherClient
 from azure.core.credentials import AzureKeyCredential
 from azure.data.tables import TableServiceClient
+import pandas as pd
+from io import BytesIO
+from azure.storage.blob import BlobServiceClient
 
 app = func.FunctionApp()
 
@@ -14,7 +17,8 @@ app = func.FunctionApp()
 IS_LOCAL_DEMO = os.getenv("IS_LOCAL_DEMO", "false").lower() == "true"
 
 # Koneksi string Azurite (baca dari local.settings.json)
-AZURITE_TABLE_CONN_STR = os.getenv("AZURITE_TABLE_CONN_STR")
+# Digunakan untuk Table (Database) dan Blob (Simpan PDF)
+AZURITE_CONN_STR = os.getenv("AZURITE_TABLE_CONN_STR")
 
 # -----------------------------------------------------------------
 # FUNGSI 1: GenerateReportFunction (EventGridTrigger)
@@ -34,7 +38,7 @@ def GenerateReportFunction(event: func.EventGridEvent):
         savings = total_income - total_expense
 
         # --- LOGIKA DATABASE DIUBAH KE AZURITE TABLE STORAGE ---
-        service = TableServiceClient.from_connection_string(conn_str=AZURITE_TABLE_CONN_STR)
+        service = TableServiceClient.from_connection_string(conn_str=AZURITE_CONN_STR)
         report_table = service.get_table_client(table_name="report")
 
         # Buat entitas laporan baru
@@ -125,29 +129,29 @@ def MonthlyReportSchedulerFunction(mytimer: func.TimerRequest) -> None:
 def OnMonthEndedFunction(event: func.EventGridEvent):
     logging.info(f"OnMonthEndedFunction dipicu oleh event: {event.event_type}")
     try:
+        # Validasi tipe event
+        if event.event_type != "Month.Ended":
+            return # Abaikan event lain (seperti ReportGeneration.Requested)
+
         month = event.get_json().get("month")
         logging.info(f"Generating monthly report for {month}")
 
         # --- LOGIKA DATABASE DIUBAH KE AZURITE TABLE STORAGE ---
-        service = TableServiceClient.from_connection_string(conn_str=AZURITE_TABLE_CONN_STR)
+        service = TableServiceClient.from_connection_string(conn_str=AZURITE_CONN_STR)
         transaction_table = service.get_table_client(table_name="transaction")
         report_table = service.get_table_client(table_name="report")
 
         # 1. Ambil semua user (dari tabel 'user' atau 'transaction')
-        # Menggunakan 'transaction' table
         entities = transaction_table.query_entities(query_filter="", select=["user_id"])
         user_ids = set(e["user_id"] for e in entities) # Gunakan 'set' untuk dapat user unik
 
         for user_id in user_ids:
             logging.info(f"Memproses laporan bulanan untuk user {user_id}...")
             
-            # 2. Agregasi transaksi bulan ini (harus manual di Python, Table Storage tidak bisa SUM)
+            # 2. Agregasi transaksi bulan ini
             total_income = 0.0
             total_expense = 0.0
             
-            # Buat query untuk filter transaksi user & bulan
-            # Table Storage tidak punya fungsi 'FORMAT', jadi harus mengambil semua dan filter di Python
-            # Ga efisien, tapi ok untuk demo lokal
             user_transactions = transaction_table.query_entities(query_filter=f"user_id eq {user_id}")
 
             for t in user_transactions:
@@ -204,3 +208,113 @@ def OnMonthEndedFunction(event: func.EventGridEvent):
         logging.error(f"Error di OnMonthEndedFunction: {e}")
         raise e
 
+# -----------------------------------------------------------------
+# FUNGSI 4: PdfGeneratorFunction (EventGridTrigger)
+# Dipicu oleh: Event "ReportGeneration.Requested" dari API Gateway
+# Tugas: Heavy Workload (CPU/Memory) -> Pandas -> Blob Storage
+# -----------------------------------------------------------------
+@app.event_grid_trigger(arg_name="event")
+def PdfGeneratorFunction(event: func.EventGridEvent):
+    logging.info(f"PdfGeneratorFunction mulai bekerja untuk event: {event.event_type}")
+
+    try:
+        # 1. Validasi Event
+        if event.event_type != "ReportGeneration.Requested":
+            return # Abaikan event lain
+
+        event_data = event.get_json()
+        user_id = event_data.get("user_id")
+        year = event_data.get("year")
+        req_id = event_data.get("request_id")
+
+        logging.info(f"Membuat Laporan Tahun {year} untuk User {user_id}")
+
+        # 2. Ambil Data dari Azurite Table (Simulasi Query Berat)
+        service = TableServiceClient.from_connection_string(conn_str=AZURITE_CONN_STR)
+        transaction_table = service.get_table_client(table_name="transaction")
+        
+        # Kita ambil semua transaksi user ini (Query O(N))
+        user_transactions = transaction_table.query_entities(query_filter=f"user_id eq {user_id}")
+        
+        data_list = []
+        for t in user_transactions:
+            # Filter tahun secara manual
+            trans_date = datetime.fromisoformat(t["transaction_date"])
+            if str(trans_date.year) == str(year):
+                data_list.append({
+                    "Date": t["transaction_date"],
+                    "Description": t["description"],
+                    "Amount": t["amount"],
+                    "Category": t.get("ai_category_name", "Uncategorized")
+                })
+
+        logging.info(f"Data terkumpul: {len(data_list)} transaksi.")
+
+        if not data_list:
+            logging.warning("Tidak ada data transaksi untuk tahun ini.")
+            return
+
+        # 3. Proses Berat Menggunakan PANDAS (Memory Bound)
+        df = pd.DataFrame(data_list)
+        
+        # Buat Pivot Table (CPU Bound)
+        pivot_summary = df.pivot_table(index="Category", values="Amount", aggfunc="sum")
+        
+        # Generate Excel File di Memory (RAM Usage)
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Transactions', index=False)
+            pivot_summary.to_excel(writer, sheet_name='Summary')
+        
+        output.seek(0) # Reset pointer file
+        file_content = output.getvalue()
+        
+        logging.info("File Excel berhasil digenerate di Memori.")
+
+        # 4. Upload ke Azure Blob Storage
+        blob_service_client = BlobServiceClient.from_connection_string(AZURITE_CONN_STR)
+        container_name = "reports"
+        
+        # Buat container jika belum ada
+        try:
+            container_client = blob_service_client.create_container(container_name)
+        except Exception:
+            container_client = blob_service_client.get_container_client(container_name)
+
+        blob_name = f"report_{user_id}_{year}_{req_id}.xlsx"
+        blob_client = container_client.get_blob_client(blob_name)
+        
+        logging.info(f"Mengupload file {blob_name} ke Blob Storage...")
+        blob_client.upload_blob(file_content, overwrite=True)
+        
+        # Generate Fake URL (karena di lokal Azurite)
+        blob_url = f"http://127.0.0.1:10000/devstoreaccount1/{container_name}/{blob_name}"
+        
+        logging.info(f"Upload Sukses! URL: {blob_url}")
+
+        # 5. Publish Event 'ReportGeneration.Completed' (Notifikasi)
+        completion_event = {
+            "id": str(uuid.uuid4()),
+            "subject": f"Report/Generation/Completed/{user_id}",
+            "data": {
+                "user_id": user_id,
+                "status": "COMPLETED",
+                "download_url": blob_url,
+                "message": "Laporan tahunan Anda siap diunduh."
+            },
+            "eventType": "ReportGeneration.Completed",
+            "eventTime": datetime.now(datetime.timezone.utc).isoformat(),
+            "dataVersion": "1.0"
+        }
+
+        if IS_LOCAL_DEMO:
+            logging.warning(f"MODE DEMO: Event 'ReportGeneration.Completed' siap (URL: {blob_url})")
+        else:
+            topic_endpoint = os.getenv("EVENTGRID_TOPIC_ENDPOINT")
+            topic_key = os.getenv("EVENTGRID_ACCESS_KEY")
+            event_grid_client = EventGridPublisherClient(topic_endpoint, AzureKeyCredential(topic_key))
+            event_grid_client.send([completion_event])
+
+    except Exception as e:
+        logging.error(f"Error di PdfGeneratorFunction: {e}")
+        raise e
