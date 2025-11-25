@@ -1,2 +1,5 @@
 azure-functions
-jwt
+azure-cosmos
+azure-eventgrid
+PyJWT
+requests

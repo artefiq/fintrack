@@ -3,176 +3,202 @@ import logging
 import json
 import os
 import jwt
-
-# --- KONFIGURASI B2C (Nanti diisi di local.settings.json) ---
-# isinya didapatkan dari portal Azure AD B2C
-B2C_TENANT_NAME = os.getenv("B2C_TENANT_NAME", "your-tenant-name")
-B2C_USER_FLOW = os.getenv("B2C_USER_FLOW", "B2C_1_signupsignin1")
-B2C_CLIENT_ID = os.getenv("B2C_CLIENT_ID", "your-app-client-id")
-B2C_ISSUER_URL = f"https://{B2C_TENANT_NAME}.b2clogin.com/{B2C_TENANT_NAME}.onmicrosoft.com/{B2C_USER_FLOW}/v2.0"
-B2C_JWKS_URL = f"https://{B2C_TENANT_NAME}.b2clogin.com/{B2C_TENANT_NAME}.onmicrosoft.com/{B2C_USER_FLOW}/discovery/v2.0/keys"
-
+from datetime import datetime
+from azure.eventgrid import EventGridPublisherClient
+from azure.core.credentials import AzureKeyCredential
+from azure.cosmos import CosmosClient, exceptions
 
 app = func.FunctionApp()
 
-# -----------------------------------------------------------------
-# HELPER: FUNGSI VALIDASI TOKEN B2C
-# -----------------------------------------------------------------
-def _get_user_info_from_token(req: func.HttpRequest) -> dict | None:
-    """
-    Membaca header 'Authorization', memvalidasi token B2C, 
-    dan mengembalikan 'claims' (info user) jika valid.
-    Mengembalikan None jika tidak valid atau tidak ada token.
-    """
-    logging.info("Memvalidasi token...")
+# --- KONFIGURASI ---
+COSMOS_CONN_STR = os.environ.get("COSMOS_DB_CONN_STR") 
+EVENTGRID_ENDPOINT = os.getenv("EVENTGRID_TOPIC_ENDPOINT")
+EVENTGRID_KEY = os.getenv("EVENTGRID_ACCESS_KEY")
+IS_LOCAL_DEMO = os.getenv("IS_LOCAL_DEMO", "false").lower() == "true"
+
+# Config Database
+DB_NAME = "fintrackdb"
+CONTAINER_NAME = "item"
+
+# --- HELPER: COSMOS DB CLIENT ---
+def get_container():
+    if not COSMOS_CONN_STR:
+        raise ValueError("COSMOS_DB_CONN_STR belum di-set di Environment Variables!")
     
-    # 1. Ambil token dari header
+    client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
+    database = client.get_database_client(DB_NAME)
+    return database.get_container_client(CONTAINER_NAME)
+
+# --- HELPER: AUTH ---
+def _get_user_info_from_token(req: func.HttpRequest) -> dict | None:
     auth_header = req.headers.get('Authorization')
     if not auth_header:
-        logging.warning("Request tidak memiliki 'Authorization' header.")
         return None
-
     try:
-        # Header harus 'Bearer <token>'
         bearer_token = auth_header.split(' ')[1]
     except IndexError:
-        logging.warning("Format 'Authorization' header salah. Harus 'Bearer <token>'.")
         return None
 
-    # --- DEBUG ---
-    # Jika token adalah "debug", kembalikan data user palsu
-    # Ini agar  bisa tes lokal tanpa B2C
     if bearer_token == "debug":
-        logging.warning("--- MENGGUNAKAN TOKEN DEBUG LOKAL ---")
         return {
-            "name": "User Debug",
-            "oid": "debug-user-id-12345", # Object ID (User ID unik dari B2C)
-            "emails": ["debug@email.com"]
+            "name": "User Debug Cosmos",
+            "oid": "user-debug-001", 
+            "emails": ["debug@cosmos.com"]
         }
-    # --- AKHIR DEBUG ---
 
-
-    # --- LOGIKA VALIDASI B2C (Untuk Cloud) ---
-    # TODO: Implementasikan validasi JWT penuh di sini
-    # 1. Ambil JWKS (public keys) dari B2C_JWKS_URL
-    # 2. Dapatkan public key yang benar dari token
-    # 3. Gunakan jwt.decode() dengan public key tersebut
-    # 4. Verifikasi 'aud' (harus B2C_CLIENT_ID)
-    # 5. Verifikasi 'iss' (harus B2C_ISSUER_URL)
-    # 6. Verifikasi 'exp' (expiry time)
-    
-    # Contoh (sederhana, tanpa validasi signature):
     try:
-        # Hanya untuk demo membaca claims
         decoded_token = jwt.decode(bearer_token, options={"verify_signature": False})
-        
-        # TODO: Validasi 'aud', 'iss', dan 'exp' di sini
-        
-        logging.info("Token berhasil divalidasi (tanpa signature).")
-        return decoded_token # 'decoded_token' berisi semua info user
-        
-    except jwt.InvalidTokenError as e:
-        logging.error(f"Token tidak valid: {str(e)}")
-        return None
+        return decoded_token
     except Exception as e:
-        logging.error(f"Error saat decode token: {str(e)}")
+        logging.error(f"Token error: {e}")
         return None
 
 # -----------------------------------------------------------------
-# FUNGSI 1: Registrasi User
+# FUNGSI 1: Registrasi User (Dengan Validasi Email)
 # -----------------------------------------------------------------
 @app.route(route="user/register", methods=["POST"])
 def UserRegistrationFunction(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Fungsi ini (harusnya) dipanggil OLEH B2C (via custom policy)
-    atau oleh client app setelah B2C berhasil membuat user
-    yang berfungsi untuk 'menyinkronkan' user B2C ke database lokal.
-    """
-    logging.info('UserRegistrationFunction memproses sebuah request.')
+    logging.info('UserRegistrationFunction started (Cosmos Mode).')
 
     try:
         req_body = req.get_json()
         email = req_body.get('email')
-        b2c_object_id = req_body.get('b2c_object_id') # ID unik dari B2C
+        b2c_object_id = req_body.get('b2c_object_id')
+        name = req_body.get('name', 'New User')
 
         if not email or not b2c_object_id:
             return func.HttpResponse(
-                json.dumps({"error": "Email dan b2c_object_id dibutuhkan."}),
-                mimetype="application/json",
-                status_code=400
+                json.dumps({"error": "Email and b2c_object_id required"}),
+                status_code=400, mimetype="application/json"
             )
 
-        # 2. TODO: Simpan user ke Database
-        #    Simpan 'email' dan 'b2c_object_id' ke tabel User 
-        logging.info(f"Menyinkronkan user baru ke DB: {email} (ID: {b2c_object_id})")
-        
-        # 3. TODO: Publish event 'User.Created' ke Event Grid
-        logging.info("Menerbitkan event User.Created...")
+        container = get_container()
 
-        # 4. Kirim respons sukses
-        response_data = {
-            "message": "User berhasil disinkronkan",
-            "user": { "email": email, "b2c_object_id": b2c_object_id }
+        # --- 1. VALIDASI EMAIL (PENTING) ---
+        # Cek apakah email sudah terdaftar oleh user lain
+        try:
+            query = "SELECT * FROM c WHERE c.email = @email AND c.type = 'user'"
+            params = [{"name": "@email", "value": email}]
+            
+            existing_users = list(container.query_items(
+                query=query,
+                parameters=params,
+                enable_cross_partition_query=True
+            ))
+
+            if len(existing_users) > 0:
+                existing_user = existing_users[0]
+                # Jika email ada TAPI id-nya beda, berarti konflik (email sudah dipakai orang lain)
+                if existing_user.get("id") != b2c_object_id:
+                    logging.warning(f"Conflict: Email {email} is already used by user {existing_user.get('id')}")
+                    return func.HttpResponse(
+                        json.dumps({"error": f"Email {email} is already registered to another account."}),
+                        status_code=409, # 409 Conflict
+                        mimetype="application/json"
+                    )
+                else:
+                    logging.info(f"User {b2c_object_id} already exists. Updating profile...")
+        
+        except Exception as e:
+            logging.error(f"Error checking existing email: {e}")
+            # Lanjut saja jika query gagal, atau return 500 tergantung kebijakan
+            pass
+
+        # --- 2. Siapkan Data User ---
+        user_item = {
+            "id": b2c_object_id,      # Primary Key
+            "user_id": b2c_object_id,
+            "type": "user",           # Discriminator
+            "email": email,
+            "name": name,
+            "created_at": datetime.utcnow().isoformat(),
+            "profile_completed": True
         }
+
+        # --- 3. Simpan ke Cosmos DB ---
+        # upsert_item akan meng-update jika ID sudah ada, atau create baru jika belum
+        container.upsert_item(user_item)
         
+        logging.info(f"User {b2c_object_id} saved to Cosmos DB.")
+
+        # --- 4. Publish Event ---
+        event_data = {
+            "id": b2c_object_id,
+            "subject": f"User/Created/{b2c_object_id}",
+            "data": {
+                "user_id": b2c_object_id,
+                "email": email,
+                "name": name
+            },
+            "eventType": "User.Created",
+            "eventTime": datetime.utcnow().isoformat(),
+            "dataVersion": "1.0"
+        }
+
+        if IS_LOCAL_DEMO:
+            logging.warning(f"MODE DEMO: Event 'User.Created' skipped.")
+        else:
+            client = EventGridPublisherClient(EVENTGRID_ENDPOINT, AzureKeyCredential(EVENTGRID_KEY))
+            client.send([event_data])
+            logging.info("Event 'User.Created' published.")
+
         return func.HttpResponse(
-            json.dumps(response_data),
-            mimetype="application/json",
-            status_code=201 # 201 Created
+            json.dumps({"message": "User registered successfully", "user_id": b2c_object_id}),
+            status_code=201, mimetype="application/json"
         )
 
+    except exceptions.CosmosHttpResponseError as e:
+        logging.error(f"Cosmos DB Error: {e.message}")
+        return func.HttpResponse(
+            json.dumps({"error": "Database Error"}), status_code=500, mimetype="application/json"
+        )
     except Exception as e:
-        logging.error(f"Error di UserRegistrationFunction: {str(e)}")
+        logging.error(f"Error: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"error": f"Terjadi kesalahan internal server: {str(e)}"}),
-            mimetype="application/json",
-            status_code=500
+            json.dumps({"error": str(e)}), status_code=500, mimetype="application/json"
         )
-
 
 # -----------------------------------------------------------------
-# FUNGSI 2: Ambil Profil User
+# FUNGSI 2: Get Profile
 # -----------------------------------------------------------------
 @app.route(route="user/profile", methods=["GET"])
 def GetUserProfileFunction(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Fungsi yang diamankan. Hanya user yang terotentikasi (dengan token valid)
-    yang bisa mengakses ini.
-    """
-    logging.info('GetUserProfileFunction memproses sebuah request.')
-    
-    # 1. Validasi token dan dapatkan info user
-    user_info = _get_user_info_from_token(req)
-    
-    if user_info is None:
-        # Jika token tidak ada atau tidak valid
-        return func.HttpResponse(
-            json.dumps({"error": "Otentikasi dibutuhkan. Token tidak valid atau tidak ada."}),
-            mimetype="application/json",
-            status_code=401 # 401 Unauthorized
-        )
+    try:
+        user_info = _get_user_info_from_token(req)
+        if not user_info:
+            return func.HttpResponse(json.dumps({"error": "Unauthorized"}), status_code=401)
 
-    # 2. Sudah punya info user yang valid (dari token)
-    user_id = user_info.get("oid") 
-    user_name = user_info.get("name", "Pengguna")
+        user_id = user_info.get("oid") 
+        
+        container = get_container()
+        
+        query = "SELECT * FROM c WHERE c.id = @id AND c.type = 'user'"
+        params = [{"name": "@id", "value": user_id}]
+        
+        items = list(container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True
+        ))
+        
+        if not items:
+            return func.HttpResponse(
+                json.dumps({"error": "User profile not found."}), 
+                status_code=404, mimetype="application/json"
+            )
 
-    # 3. TODO: Ambil data profil lengkap dari Database 
-    #    Gunakan 'user_id' (oid) untuk query ke tabel User
-    logging.info(f"Mengambil profil dari DB untuk user ID: {user_id}")
-    
-    # (db palsu)
-    db_profile_data = {
-        "user_id": user_id,
-        "name": user_name,
-        "email": user_info.get("emails", ["email-tidak-ditemukan"])[0],
-        "join_date": "2025-01-01T10:00:00Z",
-        "last_login": "2025-11-05T03:00:00Z"
-    }
+        user_entity = items[0]
 
-    # 4. Kirim respons sukses
-    return func.HttpResponse(
-        json.dumps(db_profile_data),
-        mimetype="application/json",
-        status_code=200
-    )
+        profile_data = {
+            "user_id": user_entity.get("id"),
+            "name": user_entity.get("name"),
+            "email": user_entity.get("email"),
+            "created_at": user_entity.get("created_at"),
+            "source": "cosmos_db_nosql"
+        }
+        
+        return func.HttpResponse(json.dumps(profile_data), status_code=200, mimetype="application/json")
 
+    except Exception as e:
+        logging.error(f"Error: {str(e)}")
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)

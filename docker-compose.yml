@@ -47,7 +47,8 @@ services:
     container_name: user_service
     env_file:
       - ./.env
-    # Tidak perlu 'ports', tersembunyi di dalam network Docker
+    environment:
+      COSMOS_DB_CONN_STR: ${COSMOS_DB_CONN_STR}
 
   # 4. Transaction Service (Input Data & Queue Publisher)
   transaction_service:
