@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import uuid
 import requests
 import azure.functions as func
 from azure.data.tables import TableServiceClient, UpdateMode
@@ -8,34 +9,79 @@ from azure.storage.queue import QueueClient
 
 app = func.FunctionApp()
 
-# --- KONFIGURASI & KONSTANTA ---
-# Mengambil dari environment variable (diset di docker-compose atau local.settings.json)
+# --- KONFIGURASI ---
 AI_ENDPOINT = os.environ.get("AI_SERVICE_ENDPOINT") 
-CONN_STR = os.environ.get("AZURITE_CONN_STR") # Satu connection string untuk Table & Queue di Azurite
-
-CATEGORIZED_QUEUE_NAME = "transaction-categorized"
+CONN_STR = os.environ.get("AZURITE_CONN_STR") 
 INPUT_QUEUE_NAME = "transaction-created"
+CATEGORIZED_QUEUE_NAME = "transaction-categorized"
 
-# Prompt LLM
+# Prompt
 CATEGORIZATION_PROMPT = (
-    "Anda adalah mesin ekstraksi dan kategorisasi transaksi finansial. Tugas Anda adalah mengidentifikasi "
-    "jumlah uang dan kategori dari deskripsi. Kategorikan ke 'Makanan & Minuman', 'Transportasi', "
-    " 'Kebutuhan Harian' atau 'Lainnya'. Berikan respons HANYA dalam format JSON dengan kunci 'category' (string), "
-    "'amount' (float), dan 'confidence' (float)."
+    "Identifikasi jumlah uang, nama kategori dan tipe kategori. "
+    "Nama kategori HARUS salah satu dari: 'Makanan & Minuman', 'Transportasi', 'Kebutuhan Harian', 'Gaji', 'Lainnya'. "
+    "Tipe kategori: 'Expense' atau 'Income'. "
+    "Respons JSON: {'category_name': string, 'category_type': string, 'amount': float, 'ai_confidence': float}."
 )
 
-# Category Mapping (Simulasi DB Kategori)
-CATEGORY_MAP = {
-    "Makanan & Minuman": 1,
-    "Transportasi": 2,
-    "Kebutuhan Harian": 3,
-    "Lainnya": 4,
-    "Uncategorized": 0
-}
+# --- FUNGSI HELPER BARU: Cari ID berdasarkan Nama ---
+def get_or_create_category_id(table_service, category_name, category_type, user_id):
+    """
+    Mencari apakah kombinasi (Nama + Tipe + User) sudah ada.
+    Filter unik: category_name AND category_type AND user_id.
+    """
+    try:
+        cat_table = table_service.get_table_client("category")
+        
+        # 1. PERBAIKAN FILTER: Menambahkan Type dan User ID agar unik spesifik
+        # Syntax OData: String pakai tanda kutip satu ('), Angka tidak perlu.
+        # Pastikan category_name aman dari tanda kutip (misal: McDonald's -> escape)
+        safe_name = category_name.replace("'", "''") 
+        
+        my_filter = (
+            f"category_name eq '{safe_name}'"
+            f" and category_type eq '{category_type}'"
+        )
+            # f" and user_id eq {user_id}"
+        
+        logging.info(f"Querying Category: {my_filter}")
+
+        # 2. PERBAIKAN QUERY_ENTITIES: Menggunakan parameter 'query_filter'
+        # Sebelumnya error karena pakai 'filter='
+        entities = list(cat_table.query_entities(query_filter=my_filter))
+        
+        if entities:
+            # Skenario A: Kategori Ditemukan
+            found_cat = entities[0]
+            logging.info(f"Category found: {found_cat['RowKey']} - {found_cat['category_name']}")
+            return found_cat['RowKey']
+        else:
+            # Skenario B: Kategori Baru (Belum ada di DB)
+            logging.info(f"Category '{category_name}' ({category_type}) not found. Creating new...")
+            
+            # Generate ID baru
+            new_id = str(uuid.uuid4())[:8]
+            
+            new_cat_entity = {
+                "PartitionKey": "category",
+                "RowKey": new_id,
+                "category_name": category_name,
+                "category_type": category_type,
+                "user_id": user_id
+            }
+            cat_table.create_entity(entity=new_cat_entity)
+            logging.info(f"New Category Created: {new_id}")
+            return new_id
+
+    except Exception as e:
+        logging.error(f"Error in get_or_create_category_id: {e}")
+        # Kembalikan ID default/lainnya jika DB error
+        return "0"
 
 @app.queue_trigger(arg_name="msg", queue_name=INPUT_QUEUE_NAME, connection="AZURITE_CONN_STR")
 def CategoryProcessor(msg: func.QueueMessage):
-    # 1. Menerima dan Mem-parse Event
+    logging.info(">>> FUNGSI TRIGGERED!")
+
+    # 1. Parse Event
     try:
         message_body = msg.get_body().decode('utf-8')
         transaction_data = json.loads(message_body)
@@ -43,74 +89,82 @@ def CategoryProcessor(msg: func.QueueMessage):
         transaction_pk = transaction_data.get("PartitionKey")
         transaction_rk = transaction_data.get("RowKey")
         transaction_desc = transaction_data.get("description", "")
-        
-        logging.info(f"Processing transaction: {transaction_rk} - {transaction_desc}")
-        
+        # Pastikan user_id ada untuk pencarian kategori
+        user_id = transaction_data.get("user_id", 1) 
     except Exception as e:
-        logging.error(f"Error parsing queue message: {e}")
+        logging.error(f"Error parsing: {e}")
         return
 
-    # 2. Orkestrasi AI: Memanggil AI Service
-    predicted_name = "Uncategorized"
-    predicted_id = 0
+    # 2. Panggil AI Service
+    predicted_name = "Lainnya"
+    predicted_type = "Expense"
     ai_confidence = 0.0
     extracted_amount = transaction_data.get("amount", 0.0)
 
     try:
-        if not AI_ENDPOINT:
-            raise ValueError("AI_SERVICE_ENDPOINT not set")
-
-        ai_instructions = {
-            "model_name": "gemini-2.0-flash", 
-            "system_prompt": CATEGORIZATION_PROMPT
+        if not AI_ENDPOINT: raise ValueError("AI Endpoint missing")
+        
+        payload = {
+            "text": transaction_desc, 
+            "instructions": {"model_name": "gemini-2.5-flash", "system_prompt": CATEGORIZATION_PROMPT}
         }
         
-        payload = {"text": transaction_desc, "instructions": ai_instructions}
-        
-        # Panggil AI Service (Internal Docker Call)
         response = requests.post(AI_ENDPOINT, json=payload, timeout=10)
-        response.raise_for_status() 
-
         ai_result = response.json()
         
-        # Ekstraksi Hasil
-        predicted_name = ai_result.get("category", "Uncategorized")
+        predicted_name = ai_result.get("category_name", "Lainnya")
+        predicted_type = ai_result.get("category_type", "Expense")
         ai_confidence = ai_result.get("ai_confidence", 0.0)
-        # Update amount jika AI menemukan angka yang lebih akurat dari deskripsi
-        if "amount" in ai_result and ai_result["amount"] > 0:
+        
+        if ai_result.get("amount", 0) > 0:
             extracted_amount = float(ai_result["amount"])
-        
-        predicted_id = CATEGORY_MAP.get(predicted_name, 0) # Default 0 jika tidak ada di map
-        
-        logging.info(f"AI Result for {transaction_rk}: {predicted_name} (ID: {predicted_id})")
 
     except Exception as e:
-        logging.error(f"AI Service failed or unreachable: {e}. Using defaults.")
-        # Kita tetap lanjut agar transaksi tidak macet, tapi ditandai uncategorized
+        logging.error(f"AI Failed: {e}")
 
-    # 3. Update Transaksi di Database (Azurite Table)
+    # 3. DAPATKAN ID KATEGORI DARI DB (Langkah Kunci)
     try:
         table_service = TableServiceClient.from_connection_string(CONN_STR)
+        
+        # Panggil fungsi helper tadi!
+        # Ini akan otomatis mencari ID "1" jika namanya "Makanan & Minuman"
+        final_category_id = get_or_create_category_id(
+            table_service, 
+            predicted_name, 
+            predicted_type, 
+            user_id
+        )
+        
+    except Exception as e:
+        logging.error(f"DB Lookup Failed: {e}")
+        final_category_id = 0
+
+    # 4. Update Tabel Transaksi
+    try:
         transaction_table = table_service.get_table_client("transaction")
+        # Buat tabel jika belum ada (safety dev local)
+        try: transaction_table.create_table()
+        except: pass
 
         updated_entity = {
             "PartitionKey": transaction_pk,
             "RowKey": transaction_rk,
-            "category_id": predicted_id,
+            "category_id": final_category_id, # <--- INI SUDAH BENAR (Foreign Key ID)
             "amount": extracted_amount, 
             "ai_confidence": str(ai_confidence),
-            "ai_category_name": predicted_name,
-            "status": "categorized" # Menandakan proses ini selesai
+            "ai_category_name": predicted_name, # Hanya untuk kemudahan baca (display)
+            "status": "categorized"
         }
         
-        # Merge update (hanya update field yang berubah)
-        transaction_table.update_entity(entity=updated_entity, mode=UpdateMode.MERGE)
-        logging.info(f"DB Updated for {transaction_rk}")
+        transaction_table.upsert_entity(mode=UpdateMode.MERGE, entity=updated_entity)
+        logging.info(f"SUCCESS: Transaction {transaction_rk} categorized as ID {final_category_id} ({predicted_name})")
 
     except Exception as e:
-        logging.error(f"Error updating Table Storage: {e}")
-        # Jika DB gagal update, kita mungkin ingin me-raise error agar queue di-retry
+        logging.error(f"Update Transaction Failed: {e}")
         raise e
+
+    # 5. Publish to Queue (sama seperti sebelumnya)
+    # ... pastikan kirim final_category_id juga di JSON output
 
     # 4. Publish Event ke Queue Selanjutnya (transaction-categorized)
     # Service lain (misal: Budget Service / Notification Service) bisa dengar queue ini
@@ -126,7 +180,7 @@ def CategoryProcessor(msg: func.QueueMessage):
         # Siapkan data untuk next stage
         next_event_data = transaction_data.copy()
         next_event_data.update({
-            "category_id": predicted_id,
+            "category_id": final_category_id,
             "amount": extracted_amount,
             "ai_category_name": predicted_name
         })

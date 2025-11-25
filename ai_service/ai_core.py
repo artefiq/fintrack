@@ -49,8 +49,8 @@ def process_ai_request(text_input: str, ai_instruction: dict) -> dict:
 
     # Ambil instruksi dan prompt
     system_prompt = ai_instruction.get("system_prompt", "Anda adalah asisten kategorisasi keuangan profesional.")
-    model_name = ai_instruction.get("model_name", "gemini-2.0-flash") # Gunakan model terbaru/stabil
-    
+    model_name = ai_instruction.get("model_name", "gemini-2.5-flash") 
+
     # 1. Tentukan Prompt ke LLM
     # Tips: Berikan contoh format JSON di prompt agar akurasi lebih tinggi
     prompt_text = (
@@ -58,7 +58,7 @@ def process_ai_request(text_input: str, ai_instruction: dict) -> dict:
         f"Input Transaksi: '{text_input}'\n\n"
         f"Instruksi: Analisis input di atas. "
         f"Output WAJIB JSON valid tanpa markdown (```json). "
-        f"Format JSON: {{ \"category\": \"string\", \"confidence\": float (0.0-1.0) }}"
+        # f"Format JSON: {{ \"category\": \"string\", \"confidence\": float (0.0-1.0) }}"
     )
     
     try:
@@ -78,10 +78,13 @@ def process_ai_request(text_input: str, ai_instruction: dict) -> dict:
             raw_text = raw_text.replace("```json", "").replace("```", "")
             
         ai_result = json.loads(raw_text)
+        logger.info(f"AI Result: {ai_result}")
         
         # 4. Kembalikan data yang siap digunakan
         return {
-            "category": ai_result.get("category", "Uncategorized"),
+            "category_name": ai_result.get("category_name", "Uncategorized"),
+            "category_type": ai_result.get("category_type", "Uncategorized"),
+            "amount": float(ai_result.get("amount", 0.0)),
             "ai_service_used": "gemini_llm",
             "ai_confidence": float(ai_result.get("confidence", 0.99))
         }
