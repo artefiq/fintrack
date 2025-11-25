@@ -41,20 +41,19 @@ category_table.create_entity({
     "PartitionKey": "category",
     "RowKey": "1",
     "category_name": "Makanan & Minuman",
-    "category_type": "Expense",
-    "user_id": 1
+    "category_type": "Expense"
 })
 category_table.create_entity({
     "PartitionKey": "category",
     "RowKey": "2",
     "category_name": "Gaji",
-    "category_type": "Income",
-    "user_id": 1
+    "category_type": "Income"
 })
 print("Category ditambahkan.")
 
 # TRANSACTION
 transaction_table = service.get_table_client("transaction")
+
 transaction_table.create_entity({
     "PartitionKey": "transaction",
     "RowKey": "1",
@@ -65,8 +64,11 @@ transaction_table.create_entity({
     "transaction_date": datetime.utcnow().isoformat(),
     "source": "cash",
     "ai_confidence": "0.92",
-    "input_type": "text"  # transaksi manual
+    "input_type": "text",  # transaksi manual
+    "city": "Jakarta",
+    "country": "Indonesia"
 })
+
 transaction_table.create_entity({
     "PartitionKey": "transaction",
     "RowKey": "2",
@@ -77,8 +79,12 @@ transaction_table.create_entity({
     "transaction_date": datetime.utcnow().isoformat(),
     "source": "transfer",
     "ai_confidence": "0.98",
-    "input_type": "text"  # transaksi manual
+    "input_type": "text",  # transaksi manual
+    "city": "Jakarta",
+    "country": "Indonesia"
 })
+
+print("Transaction ditambahkan.")
 print("Transaction ditambahkan.")
 
 # BUDGET
