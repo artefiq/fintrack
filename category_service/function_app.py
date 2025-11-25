@@ -89,6 +89,7 @@ def CategoryProcessor(msg: func.QueueMessage):
         transaction_pk = transaction_data.get("PartitionKey")
         transaction_rk = transaction_data.get("RowKey")
         transaction_desc = transaction_data.get("description", "")
+        transaction_input_type = transaction_data.get("input_type", "") # belum kepakai
         # Pastikan user_id ada untuk pencarian kategori
         user_id = transaction_data.get("user_id", 1) 
     except Exception as e:

@@ -65,7 +65,7 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
             # NEW — lokasi hasil reverse geocoder
             "city": location_info["city"],
             "country": location_info["country"],
-
+            "input_type": "text",
             "category_id": 0,
             "amount": float(req_body.get("amount", 0.0)), 
             "transaction_date": datetime.utcnow().isoformat(),
