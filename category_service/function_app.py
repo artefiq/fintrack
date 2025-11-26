@@ -6,6 +6,7 @@ import requests
 import azure.functions as func
 from azure.cosmos import CosmosClient, PartitionKey
 from azure.cosmos.exceptions import CosmosResourceNotFoundError
+from azure.storage.queue import QueueClient
 
 app = func.FunctionApp()
 
@@ -15,6 +16,8 @@ COSMOS_CONN_STR = os.environ.get("COSMOS_CONN_STR")
 DATABASE_NAME = os.environ.get("COSMOS_DB_NAME")
 CONTAINER_NAME = os.environ.get("COSMOS_CONTAINER_NAME") # Satu container untuk semua
 INPUT_QUEUE_NAME = os.environ.get("STORAGE_QUEUE_NAME")
+OUTPUT_QUEUE_NAME = "transaction-categorized"
+STORAGE_CONN_STR = os.environ.get("STORAGE_CONN_STR")
 
 # --- PROMPT AI ---
 # Kita minta AI mengembalikan nama & tipe agar sesuai struktur DB Category Anda
@@ -165,6 +168,34 @@ def CategoryProcessor(msg: func.QueueMessage):
         )
         
         logging.info("SUCCESS: Transaction updated in Cosmos DB.")
+
+        try:
+            # Inisialisasi Queue Client
+            queue_client = QueueClient.from_connection_string(conn_str=STORAGE_CONN_STR, queue_name=OUTPUT_QUEUE_NAME)
+            
+            # Buat Queue jika belum ada (Safety dev)
+            try: queue_client.create_queue()
+            except: pass
+
+            # Siapkan Payload Event Baru (Berisi data yang sudah 'matang')
+            next_event_payload = {
+                "event_type": "TransactionCategorized", # Penanda tipe event
+                "transaction_id": transaction_id,
+                "user_id": user_id,
+                "category": category_snapshot,          # Kirim hasil kategori
+                "amount": detected_amount,                 # Kirim amount final (hasil update AI)
+                "description": description,
+                # "timestamp": datetime.utcnow().isoformat()
+            }
+
+            # Kirim Pesan (JSON String)
+            # Karena host.json di queue trigger diset 'none' encoding, sebaiknya kirim plain string JSON juga biar konsisten
+            queue_client.send_message(json.dumps(next_event_payload))
+            
+            logging.info(f"Event published to queue: {OUTPUT_QUEUE_NAME}")
+
+        except Exception as queue_err:
+            logging.error(f"Failed to publish output queue: {queue_err}")
 
     except Exception as e:
         logging.error(f"Database Update Failed: {e}")
