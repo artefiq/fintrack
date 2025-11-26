@@ -3,279 +3,272 @@ import logging
 import json
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from azure.eventgrid import EventGridPublisherClient
 from azure.core.credentials import AzureKeyCredential
-from azure.data.tables import TableServiceClient
+from azure.cosmos import CosmosClient, exceptions
+from azure.storage.blob import BlobServiceClient
 import pandas as pd
 from io import BytesIO
-from azure.storage.blob import BlobServiceClient
 
 app = func.FunctionApp()
 
-# Cek apakah sedang dalam mode demo (untuk skip network call)
+# --- KONFIGURASI ---
 IS_LOCAL_DEMO = os.getenv("IS_LOCAL_DEMO", "false").lower() == "true"
 
-# Koneksi string Azurite (baca dari local.settings.json)
-# Digunakan untuk Table (Database) dan Blob (Simpan PDF)
-AZURITE_CONN_STR = os.getenv("AZURITE_TABLE_CONN_STR")
+# 1. Cosmos DB Config (NoSQL)
+COSMOS_CONN_STR = os.getenv("COSMOS_DB_CONN_STR")
+DB_NAME = "fintrackdb"
+CONTAINER_NAME = "item"
+
+# 2. Blob Config (Tetap butuh Storage Account biasa untuk simpan file PDF/Excel)
+BLOB_CONN_STR = os.getenv("AZURE_BLOB_CONN_STR") 
+
+# 3. Event Grid Config
+EVENTGRID_ENDPOINT = os.getenv("EVENTGRID_TOPIC_ENDPOINT")
+EVENTGRID_KEY = os.getenv("EVENTGRID_ACCESS_KEY")
+
+# --- HELPER: DB CLIENT ---
+def get_container():
+    if not COSMOS_CONN_STR:
+        raise ValueError("COSMOS_DB_CONN_STR is missing")
+    
+    client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
+    database = client.get_database_client(DB_NAME)
+    return database.get_container_client(CONTAINER_NAME)
 
 # -----------------------------------------------------------------
-# FUNGSI 1: GenerateReportFunction (EventGridTrigger)
-# Dipicu oleh: Event "Transaction.Categorized"
+# FUNGSI 1: GenerateReportFunction (Harian)
 # -----------------------------------------------------------------
 @app.event_grid_trigger(arg_name="event")
 def GenerateReportFunction(event: func.EventGridEvent):
-    logging.info(f"GenerateReportFunction dipicu oleh event: {event.event_type}")
+    logging.info(f"GenerateReportFunction dipicu: {event.event_type}")
     try:
         data = event.get_json()
         user_id = data.get("user_id")
         transactions = data.get("transactions", [])
 
-        # Hitung total income & expense
+        # Hitung total
         total_income = sum(t["amount"] for t in transactions if t["type"] == "income")
         total_expense = sum(t["amount"] for t in transactions if t["type"] == "expense")
         savings = total_income - total_expense
 
-        # --- LOGIKA DATABASE DIUBAH KE AZURITE TABLE STORAGE ---
-        service = TableServiceClient.from_connection_string(conn_str=AZURITE_CONN_STR)
-        report_table = service.get_table_client(table_name="report")
+        # Simpan ke Cosmos DB (Single Container)
+        container = get_container()
 
-        # Buat entitas laporan baru
         new_report = {
-            "PartitionKey": "report",
-            "RowKey": str(uuid.uuid4()), # Buat RowKey unik baru
-            "user_id": user_id,
+            "id": str(uuid.uuid4()),       # Wajib di Cosmos
+            "type": "report",              # Discriminator (PENTING)
             "report_type": "daily",
+            "user_id": user_id,
             "total_income": total_income,
             "total_expense": total_expense,
             "savings": savings,
-            "generated_at": datetime.utcnow().isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "storage_path": None
         }
         
-        logging.info(f"Menyimpan laporan harian untuk user {user_id} ke Azurite Table Storage")
-        report_table.create_entity(entity=new_report)
-        # --- PERUBAHAN LOGIKA DATABASE SELESAI ---
+        container.upsert_item(new_report)
+        logging.info(f"Laporan harian user {user_id} tersimpan di Cosmos DB.")
 
-        # Publish event Report.Updated
+        # Publish Event
         report_event_data = {
             "id": event.id,
             "subject": f"Report/Updated/{user_id}",
-            "data": {
-                "user_id": user_id,
-                "total_income": total_income,
-                "total_expense": total_expense,
-                "savings": savings
-            },
+            "data": new_report,
             "eventType": "Report.Updated",
-            "eventTime": datetime.utcnow().isoformat(),
+            "eventTime": datetime.now(timezone.utc).isoformat(),
             "dataVersion": "1.0"
         }
 
-        # --- Cek mode demo ---
         if IS_LOCAL_DEMO:
-            logging.warning(f"MODE DEMO: Event 'Report.Updated' tidak dikirim. Payload: {report_event_data['data']}")
+            logging.warning(f"MODE DEMO: Event 'Report.Updated' skipped.")
         else:
-            topic_endpoint = os.getenv("EVENTGRID_TOPIC_ENDPOINT")
-            topic_key = os.getenv("EVENTGRID_ACCESS_KEY")
-            event_grid_client = EventGridPublisherClient(topic_endpoint, AzureKeyCredential(topic_key))
-            event_grid_client.send([report_event_data])
-            logging.info("Event 'Report.Updated' berhasil dikirim.")
+            client = EventGridPublisherClient(EVENTGRID_ENDPOINT, AzureKeyCredential(EVENTGRID_KEY))
+            client.send([report_event_data])
+            logging.info("Event published.")
 
     except Exception as e:
         logging.error(f"Error di GenerateReportFunction: {e}")
         raise e
 
 # -----------------------------------------------------------------
-# FUNGSI 2: MonthlyReportSchedulerFunction (TimerTrigger)
+# FUNGSI 2: MonthlyReportSchedulerFunction (Timer)
 # -----------------------------------------------------------------
 @app.schedule(schedule="0 0 0 1 * *", arg_name="mytimer", run_on_startup=False) 
 def MonthlyReportSchedulerFunction(mytimer: func.TimerRequest) -> None:
-    utc_timestamp = datetime.utcnow().isoformat()
-    logging.info(f"MonthlyReportSchedulerFunction berjalan pada: {utc_timestamp}")
+    utc_timestamp = datetime.now(timezone.utc).isoformat()
+    logging.info(f"Monthly Scheduler berjalan: {utc_timestamp}")
 
     try:
         event_data = {
-            "id": "month-ended-" + utc_timestamp,
+            "id": f"month-ended-{uuid.uuid4()}",
             "subject": "Month/Ended",
-            "data": {"month": datetime.utcnow().strftime("%Y-%m")},
+            "data": {"month": datetime.now(timezone.utc).strftime("%Y-%m")},
             "eventType": "Month.Ended",
             "eventTime": utc_timestamp,
             "dataVersion": "1.0"
         }
 
-        # --- Cek mode demo ---
         if IS_LOCAL_DEMO:
-            logging.warning(f"MODE DEMO: Event 'Month.Ended' tidak dikirim. Payload: {event_data['data']}")
+            logging.warning(f"MODE DEMO: Event 'Month.Ended' skipped.")
         else:
-            topic_endpoint = os.getenv("EVENTGRID_TOPIC_ENDPOINT")
-            topic_key = os.getenv("EVENTGRID_ACCESS_KEY")
-            event_grid_client = EventGridPublisherClient(
-                topic_endpoint, AzureKeyCredential(topic_key)
-            )
-            event_grid_client.send([event_data])
-        
-        logging.info(f"Event 'Month.Ended' berhasil diproses (mode: {'demo' if IS_LOCAL_DEMO else 'publish'}).")
+            client = EventGridPublisherClient(EVENTGRID_ENDPOINT, AzureKeyCredential(EVENTGRID_KEY))
+            client.send([event_data])
+            logging.info("Event 'Month.Ended' published.")
 
     except Exception as e:
-        logging.error(f"Error in MonthlyReportSchedulerFunction: {e}")
+        logging.error(f"Error Scheduler: {e}")
         raise e
 
 # -----------------------------------------------------------------
-# FUNGSI 3: OnMonthEndedFunction (EventGridTrigger)
+# FUNGSI 3: OnMonthEndedFunction (Bulanan)
 # -----------------------------------------------------------------
 @app.event_grid_trigger(arg_name="event")
 def OnMonthEndedFunction(event: func.EventGridEvent):
-    logging.info(f"OnMonthEndedFunction dipicu oleh event: {event.event_type}")
+    logging.info(f"OnMonthEndedFunction dipicu: {event.event_type}")
     try:
-        # Validasi tipe event
         if event.event_type != "Month.Ended":
-            return # Abaikan event lain (seperti ReportGeneration.Requested)
+            return 
 
         month = event.get_json().get("month")
         logging.info(f"Generating monthly report for {month}")
 
-        # --- LOGIKA DATABASE DIUBAH KE AZURITE TABLE STORAGE ---
-        service = TableServiceClient.from_connection_string(conn_str=AZURITE_CONN_STR)
-        transaction_table = service.get_table_client(table_name="transaction")
-        report_table = service.get_table_client(table_name="report")
+        container = get_container()
 
-        # 1. Ambil semua user (dari tabel 'user' atau 'transaction')
-        entities = transaction_table.query_entities(query_filter="", select=["user_id"])
-        user_ids = set(e["user_id"] for e in entities) # Gunakan 'set' untuk dapat user unik
+        # 1. Ambil User Unik dari Transaksi di Cosmos
+        # Query SQL Cosmos DB: Ambil distinct user_id dari item tipe 'transaction'
+        query_users = "SELECT DISTINCT VALUE c.user_id FROM c WHERE c.type = 'transaction'"
+        user_ids = list(container.query_items(query=query_users, enable_cross_partition_query=True))
 
         for user_id in user_ids:
-            logging.info(f"Memproses laporan bulanan untuk user {user_id}...")
+            logging.info(f"Processing user {user_id}...")
             
-            # 2. Agregasi transaksi bulan ini
             total_income = 0.0
             total_expense = 0.0
             
-            user_transactions = transaction_table.query_entities(query_filter=f"user_id eq {user_id}")
+            # 2. Query Transaksi User Ini
+            # Kita filter by user_id dan type='transaction'
+            query_trans = "SELECT * FROM c WHERE c.type = 'transaction' AND c.user_id = @user_id"
+            params = [{"name": "@user_id", "value": user_id}]
+            
+            user_trans = container.query_items(
+                query=query_trans, parameters=params, enable_cross_partition_query=True
+            )
 
-            for t in user_transactions:
-                # Filter bulan di Python
-                trans_date = datetime.fromisoformat(t["transaction_date"])
-                if trans_date.strftime("%Y-%m") == month:
-                    if t["category_id"] == 2: # Asumsi Gaji (Income)
-                        total_income += t["amount"]
-                    else: # Asumsi lain (Expense)
-                        total_expense += t["amount"]
+            for t in user_trans:
+                try:
+                    trans_date = datetime.fromisoformat(t["transaction_date"])
+                    if trans_date.strftime("%Y-%m") == month:
+                        if t.get("category_id") == 2: 
+                            total_income += t["amount"]
+                        else:
+                            total_expense += t["amount"]
+                except:
+                    continue
 
             savings = total_income - total_expense
 
-            # 3. Simpan ke REPORT
+            # 3. Simpan Laporan Bulanan
             new_report = {
-                "PartitionKey": "report",
-                "RowKey": str(uuid.uuid4()),
-                "user_id": user_id,
+                "id": str(uuid.uuid4()),
+                "type": "report",          # Discriminator
                 "report_type": "monthly",
+                "user_id": user_id,
+                "month": month,
                 "total_income": total_income,
                 "total_expense": total_expense,
                 "savings": savings,
-                "generated_at": datetime.utcnow().isoformat(),
-                "storage_path": None
+                "generated_at": datetime.now(timezone.utc).isoformat()
             }
-            report_table.create_entity(entity=new_report)
-            logging.info(f"Laporan bulanan untuk user {user_id} berhasil disimpan.")
-        
-        # --- PERUBAHAN LOGIKA DATABASE SELESAI ---
+            container.upsert_item(new_report)
 
-        # Publish event Report.Generated
-        report_event_data = {
+        # Publish Event
+        report_gen_event = {
             "id": f"report-generated-{month}",
             "subject": f"Report/Generated/{month}",
             "data": {"month": month},
             "eventType": "Report.Generated",
-            "eventTime": datetime.utcnow().isoformat(),
+            "eventTime": datetime.now(timezone.utc).isoformat(),
             "dataVersion": "1.0"
         }
 
-        # --- Cek mode demo ---
         if IS_LOCAL_DEMO:
-            logging.warning(f"MODE DEMO: Event 'Report.Generated' tidak dikirim. Payload: {report_event_data['data']}")
+            logging.warning(f"MODE DEMO: Event 'Report.Generated' skipped.")
         else:
-            topic_endpoint = os.getenv("EVENTGRID_TOPIC_ENDPOINT")
-            topic_key = os.getenv("EVENTGRID_ACCESS_KEY")
-            event_grid_client = EventGridPublisherClient(topic_endpoint, AzureKeyCredential(topic_key))
-            event_grid_client.send([report_event_data])
-            logging.info("Event 'Report.Generated' berhasil dikirim.")
-
-        logging.info(f"✅ Laporan bulanan dan event 'Report.Generated' berhasil diproses untuk {month}")
+            client = EventGridPublisherClient(EVENTGRID_ENDPOINT, AzureKeyCredential(EVENTGRID_KEY))
+            client.send([report_gen_event])
+            logging.info("Event published.")
 
     except Exception as e:
-        logging.error(f"Error di OnMonthEndedFunction: {e}")
+        logging.error(f"Error OnMonthEnded: {e}")
         raise e
 
 # -----------------------------------------------------------------
-# FUNGSI 4: PdfGeneratorFunction (EventGridTrigger)
-# Dipicu oleh: Event "ReportGeneration.Requested" dari API Gateway
-# Tugas: Heavy Workload (CPU/Memory) -> Pandas -> Blob Storage
+# FUNGSI 4: PdfGeneratorFunction (Heavy Workload - PDF/Excel)
 # -----------------------------------------------------------------
 @app.event_grid_trigger(arg_name="event")
 def PdfGeneratorFunction(event: func.EventGridEvent):
-    logging.info(f"PdfGeneratorFunction mulai bekerja untuk event: {event.event_type}")
+    logging.info(f"PdfGeneratorFunction start: {event.event_type}")
 
     try:
-        # 1. Validasi Event
         if event.event_type != "ReportGeneration.Requested":
-            return # Abaikan event lain
+            return
 
         event_data = event.get_json()
         user_id = event_data.get("user_id")
         year = event_data.get("year")
         req_id = event_data.get("request_id")
 
-        logging.info(f"Membuat Laporan Tahun {year} untuk User {user_id}")
+        logging.info(f"🚀 Job Berat: Report {year} User {user_id}")
 
-        # 2. Ambil Data dari Azurite Table (Simulasi Query Berat)
-        service = TableServiceClient.from_connection_string(conn_str=AZURITE_CONN_STR)
-        transaction_table = service.get_table_client(table_name="transaction")
+        container = get_container()
         
-        # Kita ambil semua transaksi user ini (Query O(N))
-        user_transactions = transaction_table.query_entities(query_filter=f"user_id eq {user_id}")
+        # Query Transaksi dari Cosmos DB
+        query = "SELECT * FROM c WHERE c.type = 'transaction' AND c.user_id = @user_id"
+        params = [{"name": "@user_id", "value": str(user_id)}]
+        
+        user_trans = list(container.query_items(
+            query=query, parameters=params, enable_cross_partition_query=True
+        ))
         
         data_list = []
-        for t in user_transactions:
-            # Filter tahun secara manual
-            trans_date = datetime.fromisoformat(t["transaction_date"])
-            if str(trans_date.year) == str(year):
-                data_list.append({
-                    "Date": t["transaction_date"],
-                    "Description": t["description"],
-                    "Amount": t["amount"],
-                    "Category": t.get("ai_category_name", "Uncategorized")
-                })
-
-        logging.info(f"Data terkumpul: {len(data_list)} transaksi.")
+        for t in user_trans:
+            try:
+                trans_date = datetime.fromisoformat(t["transaction_date"])
+                if str(trans_date.year) == str(year):
+                    data_list.append({
+                        "Date": t["transaction_date"],
+                        "Description": t["description"],
+                        "Amount": t["amount"],
+                        "Category": t.get("ai_category_name", "Uncategorized")
+                    })
+            except:
+                continue
 
         if not data_list:
-            logging.warning("Tidak ada data transaksi untuk tahun ini.")
+            logging.warning("Data kosong.")
             return
 
-        # 3. Proses Berat Menggunakan PANDAS (Memory Bound)
+        # Proses Pandas
         df = pd.DataFrame(data_list)
-        
-        # Buat Pivot Table (CPU Bound)
         pivot_summary = df.pivot_table(index="Category", values="Amount", aggfunc="sum")
         
-        # Generate Excel File di Memory (RAM Usage)
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Transactions', index=False)
             pivot_summary.to_excel(writer, sheet_name='Summary')
         
-        output.seek(0) # Reset pointer file
+        output.seek(0)
         file_content = output.getvalue()
-        
-        logging.info("File Excel berhasil digenerate di Memori.")
 
-        # 4. Upload ke Azure Blob Storage
-        blob_service_client = BlobServiceClient.from_connection_string(AZURITE_CONN_STR)
+        # Upload Blob (Tetap pakai Storage Account biasa)
+        if not BLOB_CONN_STR:
+             raise ValueError("AZURE_BLOB_CONN_STR missing for file upload")
+
+        blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
         container_name = "reports"
         
-        # Buat container jika belum ada
         try:
             container_client = blob_service_client.create_container(container_name)
         except Exception:
@@ -284,37 +277,32 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
         blob_name = f"report_{user_id}_{year}_{req_id}.xlsx"
         blob_client = container_client.get_blob_client(blob_name)
         
-        logging.info(f"Mengupload file {blob_name} ke Blob Storage...")
         blob_client.upload_blob(file_content, overwrite=True)
-        
-        # Generate Fake URL (karena di lokal Azurite)
-        blob_url = f"http://127.0.0.1:10000/devstoreaccount1/{container_name}/{blob_name}"
-        
-        logging.info(f"Upload Sukses! URL: {blob_url}")
+        blob_url = blob_client.url
 
-        # 5. Publish Event 'ReportGeneration.Completed' (Notifikasi)
+        logging.info(f"Upload Sukses: {blob_url}")
+
+        # Publish Completion Event
         completion_event = {
             "id": str(uuid.uuid4()),
             "subject": f"Report/Generation/Completed/{user_id}",
             "data": {
                 "user_id": user_id,
                 "status": "COMPLETED",
-                "download_url": blob_url,
-                "message": "Laporan tahunan Anda siap diunduh."
+                "download_url": blob_url
             },
             "eventType": "ReportGeneration.Completed",
-            "eventTime": datetime.now(datetime.timezone.utc).isoformat(),
+            "eventTime": datetime.now(timezone.utc).isoformat(),
             "dataVersion": "1.0"
         }
 
         if IS_LOCAL_DEMO:
-            logging.warning(f"MODE DEMO: Event 'ReportGeneration.Completed' siap (URL: {blob_url})")
+            logging.warning(f"MODE DEMO: Event 'ReportGeneration.Completed' skipped.")
         else:
-            topic_endpoint = os.getenv("EVENTGRID_TOPIC_ENDPOINT")
-            topic_key = os.getenv("EVENTGRID_ACCESS_KEY")
-            event_grid_client = EventGridPublisherClient(topic_endpoint, AzureKeyCredential(topic_key))
-            event_grid_client.send([completion_event])
+            client = EventGridPublisherClient(EVENTGRID_ENDPOINT, AzureKeyCredential(EVENTGRID_KEY))
+            client.send([completion_event])
+            logging.info("Event published.")
 
     except Exception as e:
-        logging.error(f"Error di PdfGeneratorFunction: {e}")
+        logging.error(f"Error PdfGenerator: {e}")
         raise e

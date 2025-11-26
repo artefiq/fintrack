@@ -1,9 +1,6 @@
 azure-functions
 azure-eventgrid
-azure-functions-durable
-azure-data-tables
-pyodbc
-requests
+azure-cosmos
+azure-storage-blob
 pandas
 openpyxl
-azure-storage-blob
