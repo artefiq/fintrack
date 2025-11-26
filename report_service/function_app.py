@@ -299,6 +299,26 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
 
         logging.info(f"Upload Sukses: {blob_url}")
 
+        # simpan url ke CosmosDB
+        try:
+            # Kita menggunakan helper get_container() yang sudah ada di atas
+            # container ini mengarah ke 'fintrackdb' -> 'item'
+            report_record = {
+                "id": req_id,
+                "type": "annual_report_file",
+                "user_id": user_id,
+                "year": year,
+                "file_url": blob_url,
+                "status": "COMPLETED",
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            container.upsert_item(report_record)
+            logging.info(f"Metadata laporan disimpan ke Cosmos DB dengan ID: {req_id}")
+
+        except Exception as db_error:
+            logging.error(f"Gagal menyimpan metadata ke Cosmos DB: {db_error}")
+
         # Publish Completion Event
         completion_event = {
             "id": str(uuid.uuid4()),
