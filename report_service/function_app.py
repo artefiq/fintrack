@@ -237,11 +237,20 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
             try:
                 trans_date = datetime.fromisoformat(t["transaction_date"])
                 if str(trans_date.year) == str(year):
+
+                    cat_name = "Uncategorized"
+                    cat_type = "Expense"
+
+                    if "category" in t and isinstance(t["category"], dict):
+                        cat_name = t["category"].get("name", "Uncategorized")
+                        cat_type = t["category"].get("category_type", "Expense")
+                        
                     data_list.append({
                         "Date": t["transaction_date"],
                         "Description": t["description"],
                         "Amount": t["amount"],
-                        "Category": t.get("ai_category_name", "Uncategorized")
+                        "Category": cat_name,
+                        "Type": cat_type
                     })
             except:
                 continue
@@ -252,12 +261,20 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
 
         # Proses Pandas
         df = pd.DataFrame(data_list)
-        pivot_summary = df.pivot_table(index="Category", values="Amount", aggfunc="sum")
+        pivot_summary = df.pivot_table(
+            index=["Type", "Category"], 
+            values="Amount", 
+            aggfunc="sum"
+        )
         
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Transactions', index=False)
             pivot_summary.to_excel(writer, sheet_name='Summary')
+
+            for sheet in writer.sheets.values():
+                for column in sheet.columns:
+                    sheet.column_dimensions[column[0].column_letter].width = 20
         
         output.seek(0)
         file_content = output.getvalue()
