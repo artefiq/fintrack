@@ -4,193 +4,168 @@ import os
 import uuid
 import requests
 import azure.functions as func
-from azure.data.tables import TableServiceClient, UpdateMode
-from azure.storage.queue import QueueClient
+from azure.cosmos import CosmosClient, PartitionKey
+from azure.cosmos.exceptions import CosmosResourceNotFoundError
 
 app = func.FunctionApp()
 
 # --- KONFIGURASI ---
-AI_ENDPOINT = os.environ.get("AI_SERVICE_ENDPOINT") 
-CONN_STR = os.environ.get("AZURITE_CONN_STR") 
-INPUT_QUEUE_NAME = "transaction-created"
-CATEGORIZED_QUEUE_NAME = "transaction-categorized"
+AI_ENDPOINT = os.environ.get("AI_SERVICE_ENDPOINT")
+COSMOS_CONN_STR = os.environ.get("COSMOS_CONN_STR")
+DATABASE_NAME = os.environ.get("COSMOS_DB_NAME")
+CONTAINER_NAME = os.environ.get("COSMOS_CONTAINER_NAME") # Satu container untuk semua
+INPUT_QUEUE_NAME = os.environ.get("STORAGE_QUEUE_NAME")
 
-# Prompt
+# --- PROMPT AI ---
+# Kita minta AI mengembalikan nama & tipe agar sesuai struktur DB Category Anda
 CATEGORIZATION_PROMPT = (
     "Identifikasi jumlah uang, nama kategori dan tipe kategori. "
-    "Nama kategori HARUS salah satu dari: 'Makanan & Minuman', 'Transportasi', 'Kebutuhan Harian', 'Gaji', 'Lainnya'. "
-    "Tipe kategori: 'Expense' atau 'Income'. "
-    "Respons JSON: {'category_name': string, 'category_type': string, 'amount': float, 'ai_confidence': float}."
+    "Nama kategori HARUS salah satu dari: 'Makanan & Minuman', 'Transportasi', 'Kebutuhan Harian', 'Gaji', 'Lainnya'. Tipe kategori: 'Expense' atau 'Income'. "
+    "Output berupa JSON: {'category_name': string, 'category_type': string, 'amount': float, 'ai_confidence': float}."
 )
 
-# --- FUNGSI HELPER BARU: Cari ID berdasarkan Nama ---
-def get_or_create_category_id(table_service, category_name, category_type, user_id):
+# --- HELPER: Get or Create Category (Cosmos NoSQL Style) ---
+def get_or_create_category_snapshot(container, category_name, category_type):
     """
-    Mencari apakah kombinasi (Nama + Tipe + User) sudah ada.
-    Filter unik: category_name AND category_type AND user_id.
+    Mencari kategori di Cosmos DB berdasarkan name + type.
+    Jika tidak ada, buat dokumen 'type': 'category' baru.
+    Mengembalikan objek snapshot kategori untuk di-embed ke transaksi.
     """
-    try:
-        cat_table = table_service.get_table_client("category")
-        
-        # 1. PERBAIKAN FILTER: Menambahkan Type dan User ID agar unik spesifik
-        # Syntax OData: String pakai tanda kutip satu ('), Angka tidak perlu.
-        # Pastikan category_name aman dari tanda kutip (misal: McDonald's -> escape)
-        safe_name = category_name.replace("'", "''") 
-        
-        my_filter = (
-            f"category_name eq '{safe_name}'"
-            f" and category_type eq '{category_type}'"
-        )
-            # f" and user_id eq {user_id}"
-        
-        logging.info(f"Querying Category: {my_filter}")
+    # 1. Query ke Cosmos DB (Wajib filter by user_id agar Partition Key kena)
+    # Kita cari dokumen yang type='category' DAN namanya sama
+    ADMIN_PK = "ADMIN"
+    query = "SELECT * FROM c WHERE c.type = 'category' AND c.user_id = @user_id AND c.name = @name AND c.category_type = @category_type"
+    parameters = [
+        {"name": "@user_id", "value": ADMIN_PK},
+        {"name": "@name", "value": category_name},
+        {"name": "@category_type", "value": category_type}
+    ]
 
-        # 2. PERBAIKAN QUERY_ENTITIES: Menggunakan parameter 'query_filter'
-        # Sebelumnya error karena pakai 'filter='
-        entities = list(cat_table.query_entities(query_filter=my_filter))
+    items = list(container.query_items(
+        query=query,
+        parameters=parameters,
+        enable_cross_partition_query=False # False karena kita supply user_id
+    ))
+
+    if items:
+        # Kategori Ditemukan
+        existing_cat = items[0]
+        logging.info(f"Category Found: {existing_cat['name']} (ID: {existing_cat['id']})")
         
-        if entities:
-            # Skenario A: Kategori Ditemukan
-            found_cat = entities[0]
-            logging.info(f"Category found: {found_cat['RowKey']} - {found_cat['category_name']}")
-            return found_cat['RowKey']
-        else:
-            # Skenario B: Kategori Baru (Belum ada di DB)
-            logging.info(f"Category '{category_name}' ({category_type}) not found. Creating new...")
-            
-            # Generate ID baru
-            new_id = str(uuid.uuid4())[:8]
-            
-            new_cat_entity = {
-                "PartitionKey": "category",
-                "RowKey": new_id,
-                "category_name": category_name,
-                "category_type": category_type,
-                "user_id": user_id
-            }
-            cat_table.create_entity(entity=new_cat_entity)
-            logging.info(f"New Category Created: {new_id}")
-            return new_id
+        # Return snapshot object sesuai struktur di gambar transaksi Anda
+        return {
+            "id": existing_cat['id'],
+            "name": existing_cat['name'],
+            "category_type": existing_cat['category_type']
+        }
+    else:
+        # Kategori Baru -> Create Document
+        new_cat_id = str(uuid.uuid4())
+        logging.info(f"Creating New Category: {category_name}")
 
-    except Exception as e:
-        logging.error(f"Error in get_or_create_category_id: {e}")
-        # Kembalikan ID default/lainnya jika DB error
-        return "0"
+        new_category_doc = {
+            "id": new_cat_id,
+            "user_id": user_id,       # Partition Key
+            "type": "category",       # Discriminator
+            "name": ADMIN_PK,
+            "category_type": category_type,
+        }
 
-@app.queue_trigger(arg_name="msg", queue_name=INPUT_QUEUE_NAME, connection="AZURITE_CONN_STR")
+        container.create_item(body=new_category_doc)
+
+        return {
+            "id": new_cat_id,
+            "name": category_name,
+            "category_type": category_type
+        }
+
+@app.queue_trigger(arg_name="msg", queue_name=INPUT_QUEUE_NAME, connection="STORAGE_CONN_STR")
 def CategoryProcessor(msg: func.QueueMessage):
-    logging.info(">>> FUNGSI TRIGGERED!")
+    logging.info(">>> PROCESSING TRANSACTION FROM QUEUE (COSMOS DB)...")
 
-    # 1. Parse Event
+    # 1. Parse Event dari Queue
     try:
         message_body = msg.get_body().decode('utf-8')
-        transaction_data = json.loads(message_body)
+        transaction_doc = json.loads(message_body) # Ini dokumen utuh dari TransactionService
         
-        transaction_pk = transaction_data.get("PartitionKey")
-        transaction_rk = transaction_data.get("RowKey")
-        transaction_desc = transaction_data.get("description", "")
-        transaction_input_type = transaction_data.get("input_type", "") # belum kepakai
-        # Pastikan user_id ada untuk pencarian kategori
-        user_id = transaction_data.get("user_id", 1) 
+        transaction_id = transaction_doc.get("id")
+        user_id = transaction_doc.get("user_id") # PENTING UNTUK PARTITION KEY
+        description = transaction_doc.get("description", "")
+        current_amount = float(transaction_doc.get("amount", 0.0))
+        
+        if not transaction_id or not user_id:
+            logging.error("Invalid Message: Missing id or user_id")
+            return
+
     except Exception as e:
-        logging.error(f"Error parsing: {e}")
+        logging.error(f"Error parsing queue: {e}")
         return
 
     # 2. Panggil AI Service
     predicted_name = "Lainnya"
     predicted_type = "Expense"
     ai_confidence = 0.0
-    extracted_amount = transaction_data.get("amount", 0.0)
+    detected_amount = 0.0
 
     try:
-        if not AI_ENDPOINT: raise ValueError("AI Endpoint missing")
-        
+        # Payload ke AI Service
         payload = {
-            "text": transaction_desc, 
-            "instructions": {"model_name": "gemini-2.5-flash", "system_prompt": CATEGORIZATION_PROMPT}
+            "text": description,
+            "instructions": {
+                "model_name": "gemini-2.5-flash", 
+                "system_prompt": CATEGORIZATION_PROMPT
+            }
         }
         
         response = requests.post(AI_ENDPOINT, json=payload, timeout=10)
-        ai_result = response.json()
         
-        predicted_name = ai_result.get("category_name", "Lainnya")
-        predicted_type = ai_result.get("category_type", "Expense")
-        ai_confidence = ai_result.get("ai_confidence", 0.0)
-        
-        if ai_result.get("amount", 0) > 0:
-            extracted_amount = float(ai_result["amount"])
+        if response.status_code == 200:
+            ai_result = response.json()
+            predicted_name = ai_result.get("category_name", "Lainnya")
+            predicted_type = ai_result.get("category_type", "Expense")
+            ai_confidence = ai_result.get("ai_confidence", 0.0)
+            if "amount" in ai_result and ai_result["amount"] > 0:
+                detected_amount = float(ai_result["amount"])
+        else:
+            logging.warning(f"AI Service non-200: {response.text}")
 
     except Exception as e:
-        logging.error(f"AI Failed: {e}")
+        logging.error(f"AI Service Failed: {e}. Using Default.")
 
-    # 3. DAPATKAN ID KATEGORI DARI DB (Langkah Kunci)
+    # 3. Update Cosmos DB
     try:
-        table_service = TableServiceClient.from_connection_string(CONN_STR)
-        
-        # Panggil fungsi helper tadi!
-        # Ini akan otomatis mencari ID "1" jika namanya "Makanan & Minuman"
-        final_category_id = get_or_create_category_id(
-            table_service, 
+        client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
+        database = client.get_database_client(DATABASE_NAME)
+        container = database.get_container_client(CONTAINER_NAME)
+
+        # A. Dapatkan Object Kategori (Snapshot)
+        # Logic: Cari di DB -> Kalau ga ada buat baru -> Kembalikan {id, name, type}
+        category_snapshot = get_or_create_category_snapshot(
+            container, 
             predicted_name, 
-            predicted_type, 
-            user_id
+            predicted_type
+        )
+
+        # B. Siapkan Operasi Patch
+        patch_ops = [
+            { "op": "replace", "path": "/category", "value": category_snapshot },
+            { "op": "replace", "path": "/ai_confidence", "value": str(ai_confidence) },
+            { "op": "replace", "path": "/is_processed", "value": True }
+        ]
+
+        if detected_amount > 0:
+            logging.info(f"AI detected new amount: {detected_amount} (Old: {current_amount})")
+            patch_ops.append({ "op": "replace", "path": "/amount", "value": detected_amount })
+
+        # Eksekusi Patch
+        container.patch_item(
+            item=transaction_id,
+            partition_key=user_id,
+            patch_operations=patch_ops
         )
         
-    except Exception as e:
-        logging.error(f"DB Lookup Failed: {e}")
-        final_category_id = 0
-
-    # 4. Update Tabel Transaksi
-    try:
-        transaction_table = table_service.get_table_client("transaction")
-        # Buat tabel jika belum ada (safety dev local)
-        try: transaction_table.create_table()
-        except: pass
-
-        updated_entity = {
-            "PartitionKey": transaction_pk,
-            "RowKey": transaction_rk,
-            "category_id": final_category_id, # <--- INI SUDAH BENAR (Foreign Key ID)
-            "amount": extracted_amount, 
-            "ai_confidence": str(ai_confidence),
-            "ai_category_name": predicted_name, # Hanya untuk kemudahan baca (display)
-            "status": "categorized"
-        }
-        
-        transaction_table.upsert_entity(mode=UpdateMode.MERGE, entity=updated_entity)
-        logging.info(f"SUCCESS: Transaction {transaction_rk} categorized as ID {final_category_id} ({predicted_name})")
+        logging.info("SUCCESS: Transaction updated in Cosmos DB.")
 
     except Exception as e:
-        logging.error(f"Update Transaction Failed: {e}")
-        raise e
-
-    # 5. Publish to Queue (sama seperti sebelumnya)
-    # ... pastikan kirim final_category_id juga di JSON output
-
-    # 4. Publish Event ke Queue Selanjutnya (transaction-categorized)
-    # Service lain (misal: Budget Service / Notification Service) bisa dengar queue ini
-    try:
-        queue_client = QueueClient.from_connection_string(conn_str=CONN_STR, queue_name=CATEGORIZED_QUEUE_NAME)
-        
-        # Pastikan queue ada
-        try:
-            queue_client.create_queue()
-        except:
-            pass # Queue already exists
-        
-        # Siapkan data untuk next stage
-        next_event_data = transaction_data.copy()
-        next_event_data.update({
-            "category_id": final_category_id,
-            "amount": extracted_amount,
-            "ai_category_name": predicted_name
-        })
-        
-        # Encode ke base64 jika perlu (default python client biasanya handle string/bytes)
-        queue_client.send_message(json.dumps(next_event_data))
-        
-        logging.info(f"Message sent to queue: {CATEGORIZED_QUEUE_NAME}")
-        
-    except Exception as e:
-        logging.error(f"Error publishing to output queue: {e}")
+        logging.error(f"Database Update Failed: {e}")
         raise e

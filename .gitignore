@@ -31,6 +31,8 @@ dist
 # Python Environments
 .env
 .venv
+ai_service/.venv
+category_service/.venv
 env/
 venv/
 ENV/
