@@ -1,4 +1,4 @@
 azure-functions
-azure-data-tables
 azure-storage-queue
 reverse_geocoder
+azure-cosmos
