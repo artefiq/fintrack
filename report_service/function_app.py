@@ -220,7 +220,7 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
         year = event_data.get("year")
         req_id = event_data.get("request_id")
 
-        logging.info(f"🚀 Job Berat: Report {year} User {user_id}")
+        logging.info(f"Terima Permintaan: Report {year} User {user_id}")
 
         container = get_container()
         
