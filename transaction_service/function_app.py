@@ -1,25 +1,25 @@
-import azure.functions as func
 import logging
+import azure.functions as func
 import json
-import os
 import uuid
+import os
 from datetime import datetime
-from azure.data.tables import TableServiceClient
+import reverse_geocoder as rg # Asumsi kamu pake library ini
+from azure.cosmos import CosmosClient # <--- Library baru
 from azure.storage.queue import QueueClient
-import reverse_geocoder as rg
 
-app = func.FunctionApp()
+# Konfigurasi Environment Variable
+COSMOS_CONN_STR = os.environ.get("COSMOS_CONN_STR")
+QUEUE_CONN_STR = os.environ.get("STORAGE_CONN_STR")
+DATABASE_NAME = os.environ.get("COSMOS_DB_NAME")
+CONTAINER_NAME = os.environ.get("COSMOS_CONTAINER_NAME")
+OUTPUT_QUEUE_NAME = os.environ.get("STORAGE_QUEUE_NAME")
 
-# --- KONFIGURASI ---
-# Mengambil connection string dari environment variable
-# Di Docker, ini akan menunjuk ke 'azurite'. Di lokal, ke '127.0.0.1'.
-CONN_STR = os.environ.get("AZURITE_CONN_STR")
-OUTPUT_QUEUE_NAME = "transaction-created"
-TABLE_NAME = "transaction"
+app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 @app.route(route="transaction/create", methods=["POST"])
 def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Processing Create Transaction request.')
+    logging.info('Processing Create Transaction request (Cosmos DB Version).')
 
     try:
         req_body = req.get_json()
@@ -32,75 +32,88 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # Ambil lat/lon jika ada
+        # 2. PROSES REVERSE GEOCODER
+        # Kita siapkan default object location dulu
         lat = req_body.get("latitude")
         lon = req_body.get("longitude")
-
-        location_info = {
+        
+        location_obj = {
             "city": "Unknown",
-            "region": "Unknown",
             "country": "Unknown"
         }
 
-        # 2. PROSES REVERSE GEOCODER (kalau ada koordinat)
         if lat is not None and lon is not None:
             try:
+                # Asumsi rg.search mengembalikan list dictionary
                 result = rg.search((lat, lon))[0]
-                location_info = {
+                location_obj = {
                     "city": result.get("name", "Unknown"),
                     "country": result.get("cc", "Unknown")
                 }
-                logging.info(f"Reverse geocode: {location_info}")
+                logging.info(f"Reverse geocode result: {location_obj}")
             except Exception as e:
                 logging.error(f"Reverse geocoder failed: {str(e)}")
 
-        row_key = str(uuid.uuid4())
+        # 3. BENTUK DOKUMEN NoSQL (JSON)
+        # Ini struktur baru sesuai request kamu (Embedded & Grouping)
+        transaction_id = str(uuid.uuid4())
         
-        entity = {
-            "PartitionKey": "transaction",
-            "RowKey": row_key,
-            "user_id": req_body["user_id"],
+        document = {
+            # --- IDENTITAS DOKUMEN ---
+            "id": transaction_id,           # ID Unik Transaksi
+            "user_id": req_body["user_id"], # PARTITION KEY (Wajib ada!)
+            "type": "transaction",          # Penanda jenis data
+            
+            # --- DATA TRANSAKSI ---
+            "amount": float(req_body.get("amount", 0.0)),
             "description": req_body["description"],
-
-            # NEW — lokasi hasil reverse geocoder
-            "city": location_info["city"],
-            "country": location_info["country"],
-            "input_type": "text",
-            "category_id": 0,
-            "amount": float(req_body.get("amount", 0.0)), 
             "transaction_date": datetime.utcnow().isoformat(),
+            
+            # --- EMBEDDED OBJECTS ---
+            # Lokasi dijadikan satu object
+            "location": location_obj,
+
+            # Kategori Default (Pending)
+            # Kita isi placeholder dulu karena AI belum jalan
+            "category": {
+                "id": "0",
+                "name": "Pending Categorization",
+                "category_type": "Uncategorized"
+            },
+            
+            # --- METADATA ---
             "source": req_body.get("source", "manual_input"),
-            "ai_confidence": "0.0",
-            "ai_category_name": "Pending"
+            "input_type": "text",
+            "ai_confidence": "0.0",       # Belum ada confidence karena belum diproses AI
+            "is_processed": False         # Flag penanda kalau mau diproses worker lain
         }
 
-        # 3. Simpan ke Table Storage
-        table_service = TableServiceClient.from_connection_string(CONN_STR)
-        table_client = table_service.get_table_client(TABLE_NAME)
+        # 4. SIMPAN KE COSMOS DB
+        client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
+        database = client.get_database_client(DATABASE_NAME)
+        container = database.get_container_client(CONTAINER_NAME)
         
-        try:
-            table_client.create_entity(entity=entity)
-        except Exception:
-            table_service.create_table_if_not_exists(TABLE_NAME)
-            table_client.create_entity(entity=entity)
+        # create_item otomatis throw error kalau gagal, jadi cukup try-except luar
+        container.create_item(body=document)
 
-        # 4. Kirim ke queue
-        queue_client = QueueClient.from_connection_string(CONN_STR, OUTPUT_QUEUE_NAME)
-        
-        message_content = json.dumps(entity)
+        # 5. KIRIM KE QUEUE (Untuk diproses AI nanti)
+        # Worker AI nanti baca queue -> update category -> patch cosmos db
+        queue_client = QueueClient.from_connection_string(QUEUE_CONN_STR, OUTPUT_QUEUE_NAME)
+        message_content = json.dumps(document)
         
         try:
             queue_client.send_message(message_content)
         except Exception:
+            # Fallback kalau queue belum ada (development only)
             queue_client.create_queue()
             queue_client.send_message(message_content)
 
-        # 5. Respon
+        # 6. RESPON SUKSES
         return func.HttpResponse(
             json.dumps({
-                "message": "Transaction created",
-                "id": row_key,
-                "location": location_info,
+                "message": "Transaction created successfully",
+                "id": transaction_id,
+                "data": document, # Balikin data lengkap biar FE bisa langsung update UI
                 "status": "queued_for_categorization"
             }),
             status_code=201,
