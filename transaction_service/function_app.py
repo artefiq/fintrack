@@ -74,67 +74,69 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
 
     # --- 1. JWT SECURITY CHECK ---
     user_info = _get_user_info_from_token(req)
-    
-    # Cek Validitas Token
     if not user_info:
         return func.HttpResponse(json.dumps({"error": "Unauthorized: Invalid or Missing Token"}), status_code=401)
     
-    # AMBIL USER_ID DARI TOKEN (Secure)
-    # Kita asumsikan payload token ada field "user_id"
+    # Ambil user_id dari token
     user_id = user_info.get("user_id")
-    
     if not user_id:
          return func.HttpResponse(json.dumps({"error": "Invalid Token Payload: Missing user_id"}), status_code=401)
 
     try:
         content_type = req.headers.get("Content-Type", "")
         
-        # Variable Setup
+        # Default Variables
         description = None
         amount = 0.0
         lat = None
         lon = None
         image_url = None
         input_type = "text"
-        source = "cash" # Default sesuai request kamu
+        source = "Cash"
 
         # 2. Parsing Input (JSON vs Multipart)
         if "application/json" in content_type:
             try:
                 req_body = req.get_json()
-                # user_id TIDAK DIAMBIL DARI SINI LAGI
-                description = req_body.get("description")
-                amount = float(req_body.get("amount", 0.0))
+                # Text Input: Description WAJIB, Amount OPSIONAL (Default 0.0)
+                description = req_body.get("description") 
+                amount = float(req_body.get("amount", 0.0)) # Default 0 kalau tidak dikirim
                 lat = req_body.get("latitude")
                 lon = req_body.get("longitude")
-                source = req_body.get("source", "cash")
+                source = req_body.get("source", "Cash")
                 input_type = "text"
             except ValueError:
                 pass
 
         elif "multipart/form-data" in content_type:
-            # user_id TIDAK DIAMBIL DARI SINI LAGI
-            description = req.form.get("description", "Receipt Upload")
-            amount = float(req.form.get("amount", 0.0))
+            # Image Input: Description & Amount OPSIONAL (Default None & 0.0)
+            description = req.form.get("description") # Bisa kosong/None
+            amount = float(req.form.get("amount", 0.0)) # Default 0
             lat = req.form.get("latitude")
             lon = req.form.get("longitude")
-            source = "image_upload"
+            source = "Cash"
             input_type = "image"
 
             if 'image' in req.files:
                 file = req.files['image']
-                # Filename menggunakan user_id dari TOKEN
                 filename = f"{user_id}_{uuid.uuid4()}.jpg"
                 uploaded_url = upload_image_to_blob(file, filename)
                 if uploaded_url:
                     image_url = uploaded_url
                 else:
                     return func.HttpResponse(json.dumps({"error": "Blob upload failed"}), status_code=500)
+            else:
+                 return func.HttpResponse(json.dumps({"error": "Image file is required for multipart request"}), status_code=400)
 
-        # 3. Validasi Minimal 
-        # (Deskripsi wajib diisi kalau bukan upload gambar, user_id sudah pasti ada dari token)
-        if not description and input_type == "text":
-             return func.HttpResponse(json.dumps({"error": "Missing description"}), status_code=400)
+        # 3. Validasi Logika
+        # Jika Input Text: Description TIDAK BOLEH kosong (karena AI butuh teks buat mikir)
+        if input_type == "text" and not description:
+             return func.HttpResponse(json.dumps({"error": "Missing description for text input"}), status_code=400)
+
+        # Jika Input Image: Description BOLEH kosong.
+        # Kita kasih placeholder biar di database field-nya ada isinya (rapi).
+        if input_type == "image" and not description:
+            description = "Pending Scan" # Nanti AI/OCR yang ganti tulisan ini
 
         # 4. Reverse Geocoding
         location_obj = {"city": "Unknown", "country": "Unknown"}
@@ -149,10 +151,10 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
         transaction_id = str(uuid.uuid4())
         document = {
             "id": transaction_id,
-            "user_id": user_id, # INI DARI TOKEN
+            "user_id": user_id, # Dari Token
             "type": "transaction",
-            "amount": amount,
-            "description": description,
+            "amount": amount,       # Bisa 0.0
+            "description": description, # Bisa "Pending Scan"
             "transaction_date": datetime.utcnow().isoformat(),
             "image_url": image_url,
             "location": location_obj,
