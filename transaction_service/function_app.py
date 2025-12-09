@@ -127,3 +127,38 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
+@app.route(route="transaction/get", methods=["GET"])
+def GetTransaction(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Getting transaction detail.')
+    
+    # Ambil parameter dari Query String (?id=...&user_id=...)
+    # user_id WAJIB karena dia adalah Partition Key Cosmos DB Anda
+    doc_id = req.params.get('id')
+    user_id = req.params.get('user_id')
+
+    if not doc_id or not user_id:
+        return func.HttpResponse(
+            json.dumps({"error": "Please provide id and user_id"}),
+            status_code=400
+        )
+
+    try:
+        client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
+        database = client.get_database_client(DATABASE_NAME)
+        container = database.get_container_client(CONTAINER_NAME)
+
+        # Baca Item dari Cosmos DB
+        # read_item butuh ID dan Partition Key
+        item = container.read_item(item=doc_id, partition_key=user_id)
+        
+        return func.HttpResponse(
+            json.dumps(item),
+            status_code=200,
+            mimetype="application/json"
+        )
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"error": "Transaction not found or error"}),
+            status_code=404
+        )
