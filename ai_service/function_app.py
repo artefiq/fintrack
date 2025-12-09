@@ -56,3 +56,20 @@ def LanguageFunction(req: func.HttpRequest) -> func.HttpResponse:
              mimetype="application/json",
              status_code=500
         )
+
+@app.route(route="ai/ocr", methods=["POST"])
+def OcrFunction(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        req_body = req.get_json()
+        image_url = req_body.get('image_url')
+        instructions = req_body.get('instructions') # <--- AMBIL INSTRUCTIONS DARI REQUEST
+
+        if not image_url or not instructions:
+             return func.HttpResponse(json.dumps({"error": "Missing image_url or instructions"}), status_code=400)
+
+        # Lempar ke Core
+        ocr_result = ai_core.process_receipt_ocr(image_url, instructions)
+        
+        return func.HttpResponse(json.dumps(ocr_result), status_code=200, mimetype="application/json")
+    except Exception as e:
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)

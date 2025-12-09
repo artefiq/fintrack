@@ -1,2 +1,5 @@
 azure-functions
 google-genai
+requests
+azure-ai-formrecognizer
+azure-core

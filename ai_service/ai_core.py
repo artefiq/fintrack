@@ -4,45 +4,52 @@ import json
 from google import genai
 from google.genai.errors import APIError
 
+# --- LIBRARY BARU UNTUK AZURE OCR ---
+from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.core.credentials import AzureKeyCredential
+
 # Setup Logging
 logger = logging.getLogger(__name__)
 
-# --- Initialisasi Klien Gemini ---
-# Variabel global untuk menyimpan status klien
+# --- GLOBAL VARS ---
 gemini_client = None
 AI_CLIENT_INITIALIZED = False
 
-def _initialize_client():
-    """
-    Fungsi internal untuk inisialisasi lazy loading.
-    Hanya mencoba connect saat request pertama masuk, atau jika belum connect.
-    """
+# ==========================================
+# BAGIAN 1: INISIALISASI KLIEN (GEMINI & AZURE)
+# ==========================================
+
+def _initialize_gemini():
+    """Lazy load untuk Gemini Client"""
     global gemini_client, AI_CLIENT_INITIALIZED
-    
-    if AI_CLIENT_INITIALIZED:
-        return
+    if AI_CLIENT_INITIALIZED: return
 
     try:
         API_KEY = os.environ.get("GEMINI_API_KEY")
-        if not API_KEY:
-            raise KeyError("GEMINI_API_KEY not found in environment variables.")
-            
-        # Inisialisasi klien Gemini
+        if not API_KEY: raise KeyError("GEMINI_API_KEY missing.")
         gemini_client = genai.Client(api_key=API_KEY)
         AI_CLIENT_INITIALIZED = True
-        logger.info("Gemini Client successfully initialized.")
-        
+        logger.info("Gemini Client initialized.")
     except Exception as e:
-        logger.error(f"Failed to initialize Gemini Client: {e}")
+        logger.error(f"Gemini Init Failed: {e}")
         AI_CLIENT_INITIALIZED = False
-        gemini_client = None
+
+def _get_azure_client():
+    """Helper untuk membuat Azure Document Intelligence Client saat dibutuhkan"""
+    endpoint = os.environ.get("AZURE_FORM_ENDPOINT")
+    key = os.environ.get("AZURE_FORM_KEY")
+    
+    if not endpoint or not key:
+        raise ValueError("AZURE_FORM_ENDPOINT or AZURE_FORM_KEY is missing.")
+        
+    return DocumentAnalysisClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
 def process_ai_request(text_input: str, ai_instruction: dict) -> dict:
     """
     Fungsi modular yang memproses permintaan AI (LLM).
     """
     # Coba inisialisasi jika belum
-    _initialize_client()
+    _initialize_gemini()
 
     if not AI_CLIENT_INITIALIZED:
         raise ConnectionError("Gemini Client not initialized. Check GEMINI_API_KEY configuration.")
@@ -102,3 +109,89 @@ def process_ai_request(text_input: str, ai_instruction: dict) -> dict:
     except Exception as e:
         logger.error(f"General AI processing error: {e}")
         raise Exception(f"General AI processing error: {e}")
+
+def process_receipt_ocr(image_url: str, ai_instruction: dict) -> dict: 
+    try:
+        # 1. AZURE OCR
+        azure_client = _get_azure_client()
+        poller = azure_client.begin_analyze_document_from_url("prebuilt-receipt", image_url)
+        result = poller.result()
+        
+        if not result.documents:
+            raise Exception("No document detected by Azure")
+
+        receipt = result.documents[0]
+        
+        # --- STRATEGI A: COBA AMBIL DARI FIELDS (Structured) ---
+        merchant = receipt.fields.get("MerchantName")
+        merchant_str = merchant.value if merchant else "Unknown"
+        
+        total_field = receipt.fields.get("Total")
+        azure_amount = total_field.value if total_field else 0.0
+        
+        # Ambil items dari fields
+        items_list = []
+        if "Items" in receipt.fields:
+            for item in receipt.fields.get("Items").value:
+                d = item.value.get("Description")
+                if d: items_list.append(d.value)
+        items_str = ", ".join(items_list)
+
+        # --- STRATEGI B: FALLBACK KE RAW CONTENT (Unstructured) ---
+        # Ini adalah jaring pengaman jika fields gagal
+        raw_full_text = result.content  # <--- INI KUNCINYA
+        logger.info(f"Azure OCR Raw Text: {raw_full_text}")
+        
+        # Tentukan teks mana yang akan dikirim ke Gemini
+        if azure_amount > 0 and merchant_str != "Unknown":
+            # Jika Azure sukses, kirim ringkasan saja (hemat token)
+            text_for_ai = f"Merchant: {merchant_str}. Items: {items_str}. Total: {azure_amount}"
+            logger.info("Azure Fields Valid. Using structured data.")
+        else:
+            # JIKA AZURE FIELDS SALAH/KOSONG:
+            # Kirim SELURUH teks mentah ke Gemini. Biarkan Gemini yang mencari totalnya.
+            text_for_ai = f"""
+            SYSTEM WARNING: Azure gagal untuk mengekstrak field terstruktur dengan sempurna.
+            Ini adalah FULL RAW TEXT dari receipt:
+            ---
+            {raw_full_text}
+            ---
+            """
+            logger.warning("Azure Fields Incomplete/Zero. Sending RAW CONTENT to Gemini.")
+
+        # 2. GEMINI PROCESSING (Dengan Retry Logic 429)
+        cat_result = {}
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Pastikan prompt di process_ai_request meminta return JSON dengan field 'amount'
+                cat_result = process_ai_request(text_for_ai, ai_instruction)
+                break 
+            except Exception as e:
+                if "429" in str(e):
+                    time.sleep(2 ** attempt)
+                else:
+                    break
+
+        # 3. FINAL MERGE
+        # Prioritas nilai Amount:
+        # 1. Gemini (karena dia melihat raw text atau memperbaiki Azure)
+        # 2. Azure (kalau Gemini gagal/error/tidak nemu)
+        
+        final_amount = cat_result.get("amount", 0.0)
+        if final_amount == 0.0:
+            final_amount = azure_amount
+
+        # C. Gabungkan Hasil
+        return {
+            "description": raw_full_text, 
+            "amount": final_amount, # Amount diambil dari Azure (lebih percaya Azure)
+            "category_name": cat_result.get("category_name", "Uncategorized"),
+            "category_type": cat_result.get("category_type", "Expense"),
+            "ai_confidence": float(cat_result.get("ai_confidence", 0.99)),
+            "is_ocr_success": True
+        }
+
+    except Exception as e:
+        logger.error(f"OCR Error: {e}")
+        return {"error": str(e), "is_ocr_success": False}

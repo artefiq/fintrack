@@ -11,7 +11,8 @@ from azure.storage.queue import QueueClient
 app = func.FunctionApp()
 
 # --- KONFIGURASI ---
-AI_ENDPOINT = os.environ.get("AI_SERVICE_ENDPOINT")
+LANGUAGE_ENDPOINT = os.environ.get("AI_SERVICE_LANGUAGE_ENDPOINT")
+OCR_ENDPOINT = os.environ.get("AI_SERVICE_OCR_ENDPOINT")
 COSMOS_CONN_STR = os.environ.get("COSMOS_CONN_STR")
 DATABASE_NAME = os.environ.get("COSMOS_DB_NAME")
 CONTAINER_NAME = os.environ.get("COSMOS_CONTAINER_NAME") # Satu container untuk semua
@@ -84,22 +85,34 @@ def get_or_create_category_snapshot(container, category_name, category_type):
 
 @app.queue_trigger(arg_name="msg", queue_name=INPUT_QUEUE_NAME, connection="STORAGE_CONN_STR")
 def CategoryProcessor(msg: func.QueueMessage):
-    logging.info(">>> PROCESSING TRANSACTION FROM QUEUE (COSMOS DB)...")
+    logging.info(">>> PROCESSING TRANSACTION FROM QUEUE...")
 
-    # 1. Parse Event dari Queue
-    try:
+    # Variabel inisialisasi awal agar scope aman
+    transaction_id = None
+    user_id = None
+    description = ""
+    current_amount = 0.0
+    input_type = "text"
+    image_url = None
+
+    # 1. Parse Event
+    try:    
         message_body = msg.get_body().decode('utf-8')
-        transaction_doc = json.loads(message_body) # Ini dokumen utuh dari TransactionService
+        transaction_doc = json.loads(message_body)
         
         transaction_id = transaction_doc.get("id")
-        user_id = transaction_doc.get("user_id") # PENTING UNTUK PARTITION KEY
+        user_id = transaction_doc.get("user_id")
+        
+        input_type = transaction_doc.get("input_type", "text")
+        image_url = transaction_doc.get("image_url")
         description = transaction_doc.get("description", "")
-        current_amount = float(transaction_doc.get("amount", 0.0))
+        # FIX: Ambil amount lama agar tidak error reference
+        current_amount = float(transaction_doc.get("amount", 0.0)) 
         
         if not transaction_id or not user_id:
             logging.error("Invalid Message: Missing id or user_id")
             return
-
+            
     except Exception as e:
         logging.error(f"Error parsing queue: {e}")
         return
@@ -110,88 +123,101 @@ def CategoryProcessor(msg: func.QueueMessage):
     ai_confidence = 0.0
     detected_amount = 0.0
 
+    standard_instructions = {
+        "model_name": "gemini-2.5-flash",
+        "system_prompt": CATEGORIZATION_PROMPT
+    }
+
     try:
-        # Payload ke AI Service
-        payload = {
-            "text": description,
-            "instructions": {
-                "model_name": "gemini-2.5-flash", 
-                "system_prompt": CATEGORIZATION_PROMPT
-            }
-        }
+        response = None
         
-        response = requests.post(AI_ENDPOINT, json=payload, timeout=10)
+        if input_type == "image" and image_url:
+            logging.info(f"Processing Image Transaction: {image_url}")
+            payload = {"image_url": image_url, "instructions": standard_instructions}
+            # Pastikan OCR_ENDPOINT tidak None
+            if OCR_ENDPOINT:
+                response = requests.post(OCR_ENDPOINT, json=payload, timeout=15)
+            else:
+                logging.error("OCR_ENDPOINT not set!")
+        else:
+            logging.info("Processing Text Transaction")
+            payload = {"text": description, "instructions": standard_instructions}
+            if LANGUAGE_ENDPOINT:
+                response = requests.post(LANGUAGE_ENDPOINT, json=payload, timeout=10)
+            else:
+                logging.error("LANGUAGE_ENDPOINT not set!")
         
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             ai_result = response.json()
             predicted_name = ai_result.get("category_name", "Lainnya")
             predicted_type = ai_result.get("category_type", "Expense")
             ai_confidence = ai_result.get("ai_confidence", 0.0)
+
+            # Update description jika OCR memberikan detail lebih baik
+            if "description" in ai_result and input_type == "image":
+                description = ai_result["description"]
+
             if "amount" in ai_result and ai_result["amount"] > 0:
                 detected_amount = float(ai_result["amount"])
         else:
-            logging.warning(f"AI Service non-200: {response.text}")
+            if response:
+                logging.warning(f"AI Service non-200: {response.text}")
 
     except Exception as e:
         logging.error(f"AI Service Failed: {e}. Using Default.")
 
     # 3. Update Cosmos DB
     try:
+        if not COSMOS_CONN_STR: raise ValueError("COSMOS_CONN_STR missing")
+        
         client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
         database = client.get_database_client(DATABASE_NAME)
         container = database.get_container_client(CONTAINER_NAME)
 
-        # A. Dapatkan Object Kategori (Snapshot)
-        # Logic: Cari di DB -> Kalau ga ada buat baru -> Kembalikan {id, name, type}
+        # A. Get Category Snapshot
         category_snapshot = get_or_create_category_snapshot(
-            container, 
-            predicted_name, 
-            predicted_type
+            container, predicted_name, predicted_type
         )
 
-        # B. Siapkan Operasi Patch
+        # B. Patch Operations
         patch_ops = [
-            { "op": "replace", "path": "/category", "value": category_snapshot },
-            { "op": "replace", "path": "/ai_confidence", "value": str(ai_confidence) },
-            { "op": "replace", "path": "/is_processed", "value": True }
+            { "op": "add", "path": "/category", "value": category_snapshot },
+            { "op": "add", "path": "/ai_confidence", "value": str(ai_confidence) },
+            { "op": "add", "path": "/is_processed", "value": True }
         ]
 
+        # Update amount jika AI menemukan angka baru
         if detected_amount > 0:
-            logging.info(f"AI detected new amount: {detected_amount} (Old: {current_amount})")
-            patch_ops.append({ "op": "replace", "path": "/amount", "value": detected_amount })
+            logging.info(f"AI detected amount: {detected_amount} (Old: {current_amount})")
+            patch_ops.append({ "op": "add", "path": "/amount", "value": detected_amount })
+        
+        # Update description jika berubah (hasil OCR)
+        if description != transaction_doc.get("description", ""):
+             patch_ops.append({ "op": "add", "path": "/description", "value": description })
 
-        # Eksekusi Patch
         container.patch_item(
             item=transaction_id,
             partition_key=user_id,
             patch_operations=patch_ops
         )
-        
         logging.info("SUCCESS: Transaction updated in Cosmos DB.")
 
+        # 4. Publish to Output Queue
         try:
-            # Inisialisasi Queue Client
             queue_client = QueueClient.from_connection_string(conn_str=STORAGE_CONN_STR, queue_name=OUTPUT_QUEUE_NAME)
-            
-            # Buat Queue jika belum ada (Safety dev)
             try: queue_client.create_queue()
             except: pass
 
-            # Siapkan Payload Event Baru (Berisi data yang sudah 'matang')
             next_event_payload = {
-                "event_type": "TransactionCategorized", # Penanda tipe event
+                "event_type": "TransactionCategorized",
                 "transaction_id": transaction_id,
                 "user_id": user_id,
-                "category": category_snapshot,          # Kirim hasil kategori
-                "amount": detected_amount,                 # Kirim amount final (hasil update AI)
+                "category": category_snapshot,
+                "amount": detected_amount if detected_amount > 0 else current_amount,
                 "description": description,
-                # "timestamp": datetime.utcnow().isoformat()
             }
 
-            # Kirim Pesan (JSON String)
-            # Karena host.json di queue trigger diset 'none' encoding, sebaiknya kirim plain string JSON juga biar konsisten
             queue_client.send_message(json.dumps(next_event_payload))
-            
             logging.info(f"Event published to queue: {OUTPUT_QUEUE_NAME}")
 
         except Exception as queue_err:
