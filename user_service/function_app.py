@@ -83,6 +83,7 @@ def UserRegister(req: func.HttpRequest) -> func.HttpResponse:
         # 3. Simpan ke Cosmos DB
         user_id = str(uuid.uuid4())
         user_item = {
+            "id": user_id,
             "user_id": user_id,
             "type": "user",
             "email": email,
