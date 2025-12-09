@@ -72,42 +72,48 @@ def upload_image_to_blob(file, filename):
 def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Processing Create Transaction request.')
 
-    # --- 1. JWT SECURITY CHECK (BARU) ---
+    # --- 1. JWT SECURITY CHECK ---
     user_info = _get_user_info_from_token(req)
+    
+    # Cek Validitas Token
     if not user_info:
         return func.HttpResponse(json.dumps({"error": "Unauthorized: Invalid or Missing Token"}), status_code=401)
-
-    # Optional: Kamu bisa memaksa user_id diambil dari token, bukan dari body
-    # user_id_from_token = user_info.get("user_id")
+    
+    # AMBIL USER_ID DARI TOKEN (Secure)
+    # Kita asumsikan payload token ada field "user_id"
+    user_id = user_info.get("user_id")
+    
+    if not user_id:
+         return func.HttpResponse(json.dumps({"error": "Invalid Token Payload: Missing user_id"}), status_code=401)
 
     try:
         content_type = req.headers.get("Content-Type", "")
         
-        user_id = None
+        # Variable Setup
         description = None
         amount = 0.0
         lat = None
         lon = None
         image_url = None
         input_type = "text"
-        source = "manual_input"
+        source = "cash" # Default sesuai request kamu
 
-        # 2. Parsing Input
+        # 2. Parsing Input (JSON vs Multipart)
         if "application/json" in content_type:
             try:
                 req_body = req.get_json()
-                user_id = req_body.get("user_id")
+                # user_id TIDAK DIAMBIL DARI SINI LAGI
                 description = req_body.get("description")
                 amount = float(req_body.get("amount", 0.0))
                 lat = req_body.get("latitude")
                 lon = req_body.get("longitude")
-                source = req_body.get("source", "manual_input")
+                source = req_body.get("source", "cash")
                 input_type = "text"
             except ValueError:
                 pass
 
         elif "multipart/form-data" in content_type:
-            user_id = req.form.get("user_id")
+            # user_id TIDAK DIAMBIL DARI SINI LAGI
             description = req.form.get("description", "Receipt Upload")
             amount = float(req.form.get("amount", 0.0))
             lat = req.form.get("latitude")
@@ -117,6 +123,7 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
 
             if 'image' in req.files:
                 file = req.files['image']
+                # Filename menggunakan user_id dari TOKEN
                 filename = f"{user_id}_{uuid.uuid4()}.jpg"
                 uploaded_url = upload_image_to_blob(file, filename)
                 if uploaded_url:
@@ -124,9 +131,10 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
                 else:
                     return func.HttpResponse(json.dumps({"error": "Blob upload failed"}), status_code=500)
 
-        # 3. Validasi Minimal
-        if not user_id:
-            return func.HttpResponse(json.dumps({"error": "Missing user_id"}), status_code=400)
+        # 3. Validasi Minimal 
+        # (Deskripsi wajib diisi kalau bukan upload gambar, user_id sudah pasti ada dari token)
+        if not description and input_type == "text":
+             return func.HttpResponse(json.dumps({"error": "Missing description"}), status_code=400)
 
         # 4. Reverse Geocoding
         location_obj = {"city": "Unknown", "country": "Unknown"}
@@ -141,7 +149,7 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
         transaction_id = str(uuid.uuid4())
         document = {
             "id": transaction_id,
-            "user_id": user_id,
+            "user_id": user_id, # INI DARI TOKEN
             "type": "transaction",
             "amount": amount,
             "description": description,
@@ -179,117 +187,35 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
 def GetTransaction(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Getting transaction detail.')
     
-    # --- 1. JWT SECURITY CHECK (BARU) ---
+    # --- 1. JWT SECURITY CHECK ---
     user_info = _get_user_info_from_token(req)
     if not user_info:
         return func.HttpResponse(json.dumps({"error": "Unauthorized: Invalid or Missing Token"}), status_code=401)
 
-    doc_id = req.params.get('id')
-    user_id = req.params.get('user_id')
+    # --- 2. AMBIL USER_ID DARI TOKEN (SECURE) ---
+    # Kita abaikan req.params.get('user_id') agar user tidak bisa memalsukan identitas
+    user_id = user_info.get("user_id")
 
-    if not doc_id or not user_id:
-        return func.HttpResponse(json.dumps({"error": "Please provide id and user_id"}), status_code=400)
+    if not user_id:
+         return func.HttpResponse(json.dumps({"error": "Invalid Token Payload: Missing user_id"}), status_code=401)
+
+    # --- 3. AMBIL TRANSACTION ID DARI PARAM ---
+    doc_id = req.params.get('id')
+
+    if not doc_id:
+        return func.HttpResponse(json.dumps({"error": "Please provide transaction id"}), status_code=400)
 
     try:
         client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
         database = client.get_database_client(DATABASE_NAME)
         container = database.get_container_client(CONTAINER_NAME)
 
+        # BACA ITEM
+        # Kuncinya di sini: partition_key=user_id (dari token).
+        # Kalau doc_id tersebut milik orang lain, Cosmos DB akan menganggapnya "Tidak Ada" (404)
         item = container.read_item(item=doc_id, partition_key=user_id)
         
         return func.HttpResponse(json.dumps(item), status_code=200, mimetype="application/json")
     except Exception as e:
-        return func.HttpResponse(json.dumps({"error": "Transaction not found or error"}), status_code=404)
-
-
-@app.route(route="admin/dataset/json", methods=["GET"])
-def AdminDashboardData(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Fetching Admin Dashboard Data (JSON) with Filters.')
-
-    # --- 1. JWT SECURITY CHECK ---
-    user_info = _get_user_info_from_token(req)
-
-    if not user_info:
-        return func.HttpResponse(json.dumps({"error": "Unauthorized or Invalid Token"}), status_code=401)
-    
-    if user_info.get("role") != "admin":
-        return func.HttpResponse(json.dumps({"error": "Access Denied: Admins only"}), status_code=403)
-
-    # --- 2. AMBIL PARAMETER FILTER ---
-    start_date = req.params.get('start_date') 
-    end_date = req.params.get('end_date')      
-    category_filter = req.params.get('category') 
-
-    try:
-        client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
-        container = client.get_database_client(DATABASE_NAME).get_container_client(CONTAINER_NAME)
-
-        # --- 3. BANGUN QUERY DINAMIS ---
-        query = "SELECT * FROM c WHERE 1=1"
-        parameters = []
-
-        if start_date and end_date:
-            query += " AND c.transaction_date >= @start AND c.transaction_date <= @end"
-            parameters.append({"name": "@start", "value": f"{start_date}T00:00:00"})
-            parameters.append({"name": "@end", "value": f"{end_date}T23:59:59"})
-
-        if category_filter:
-            query += " AND c.category.name = @category"
-            parameters.append({"name": "@category", "value": category_filter})
-
-        items = list(container.query_items(
-            query=query,
-            parameters=parameters,
-            enable_cross_partition_query=True
-        ))
-
-        # --- 4. DATA PROCESSING & ANONYMIZATION ---
-        dashboard_data = []
-        
-        for item in items:
-            raw_user_id = item.get("user_id", "unknown")
-            hashed_user = hashlib.sha256(raw_user_id.encode()).hexdigest()[:8]
-
-            trx_date_str = item.get("transaction_date", "")
-            try:
-                dt_obj = datetime.fromisoformat(trx_date_str)
-                iso_date = dt_obj.isoformat() 
-                hour_val = dt_obj.hour
-                day_val = dt_obj.strftime("%A")
-            except:
-                iso_date = trx_date_str
-                hour_val = 0
-                day_val = "Unknown"
-
-            dashboard_data.append({
-                "id": item.get("id"),
-                "user_hash": hashed_user,
-                "date_full": iso_date,
-                "day_name": day_val,
-                "hour": hour_val,
-                "amount": item.get("amount", 0),
-                "description": item.get("description", ""),
-                "category": item.get("category", {}).get("name", "Uncategorized"),
-                "type": item.get("category", {}).get("category_type", "Expense"),
-                "city": item.get("location", {}).get("city", "Unknown"),
-                "source": item.get("source", "manual")
-            })
-
-        return func.HttpResponse(
-            body=json.dumps({
-                "message": "Data fetched successfully",
-                "filters_applied": {
-                    "start": start_date,
-                    "end": end_date,
-                    "category": category_filter
-                },
-                "total_rows": len(dashboard_data),
-                "data": dashboard_data
-            }),
-            status_code=200,
-            mimetype="application/json"
-        )
-
-    except Exception as e:
-        logging.error(f"Dashboard Data Error: {str(e)}")
-        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)
+        # Error biasanya karena 404 Not Found (Entah ID salah, atau ID benar tapi punya orang lain)
+        return func.HttpResponse(json.dumps({"error": "Transaction not found"}), status_code=404)
