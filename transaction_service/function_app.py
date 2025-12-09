@@ -114,7 +114,7 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
             amount = float(req.form.get("amount", 0.0)) # Default 0
             lat = req.form.get("latitude")
             lon = req.form.get("longitude")
-            source = "Cash"
+            source = req.form.get("source", "Cash")
             input_type = "image"
 
             if 'image' in req.files:
