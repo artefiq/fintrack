@@ -188,7 +188,7 @@ def process_receipt_ocr(image_url: str, ai_instruction: dict) -> dict:
             "amount": final_amount, # Amount diambil dari Azure (lebih percaya Azure)
             "category_name": cat_result.get("category_name", "Uncategorized"),
             "category_type": cat_result.get("category_type", "Expense"),
-            "ai_confidence": float(cat_result.get("confidence", 0.99)),
+            "ai_confidence": float(cat_result.get("ai_confidence", 0.99)),
             "is_ocr_success": True
         }
 
