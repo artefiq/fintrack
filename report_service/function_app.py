@@ -488,18 +488,16 @@ def GetReportStatusFunction(req: func.HttpRequest) -> func.HttpResponse:
 def GetReportHistoryFunction(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("Mengambil riwayat laporan user...")
 
-    # 1. Validasi Token (Mandiri)
+    # 1. Validasi Token
     user_info = _get_user_info_from_token(req)
     if not user_info:
         return func.HttpResponse(json.dumps({"error": "Unauthorized"}), status_code=401, mimetype="application/json")
 
-    # 2. Ambil User ID dari dalam Token
-    # Token berisi: {"oid": "...", "name": "...", ...}
-    user_id = user_info.get("oid")
+    # 2. Ambil User ID
+    user_id = user_info.get("user_id") 
     
     if not user_id:
-         return func.HttpResponse(json.dumps({"error": "Invalid Token Data"}), status_code=401, mimetype="application/json")
-
+        return func.HttpResponse(json.dumps({"error": "Invalid Token Data: user_id missing"}), status_code=401, mimetype="application/json")
     try:
         container = get_container() # Helper yang sudah ada (konek ke fintrackdb -> item)
         
