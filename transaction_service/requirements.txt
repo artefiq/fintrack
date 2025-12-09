@@ -3,3 +3,4 @@ azure-storage-queue
 reverse_geocoder
 azure-cosmos
 azure-storage-blob
+PyJWT
