@@ -148,3 +148,38 @@ def gateway(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=500
         )
+    
+# ---------------------------------------------------------------------------
+# 3. FUNGSI KHUSUS: Cek Status Laporan (Untuk Polling)
+# Endpoint: GET /report/status/{request_id}
+# ---------------------------------------------------------------------------
+@app.route(route="report/status/{request_id}", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def CheckReportStatus(req: func.HttpRequest) -> func.HttpResponse:
+    request_id = req.route_params.get('request_id')
+    logging.info(f"Gateway: Checking status for {request_id}")
+
+    try:
+        # Kita lempar request ini ke REPORT_SERVICE_URL
+        report_service_url = os.getenv("REPORT_SERVICE_URL")
+        
+        if not report_service_url:
+            return func.HttpResponse(json.dumps({"error": "Report Service URL not set"}), status_code=500)
+
+        # Hati-hati dengan slash ganda
+        target_url = f"{report_service_url.rstrip('/')}/report/status/{request_id}"
+        
+        # Teruskan Header (termasuk Authorization Token jika ada)
+        fwd_headers = {key: value for (key, value) in req.headers.items() if key.lower() != 'host'}
+
+        # Panggil Report Service
+        resp = requests.get(target_url, headers=fwd_headers)
+
+        return func.HttpResponse(
+            resp.content,
+            status_code=resp.status_code,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Gateway Status Check Error: {e}")
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)

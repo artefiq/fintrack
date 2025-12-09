@@ -217,14 +217,60 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
 
         event_data = event.get_json()
         user_id = event_data.get("user_id")
-        year = event_data.get("year")
+        year = str(event_data.get("year")) # Pastikan string
         req_id = event_data.get("request_id")
 
-        logging.info(f"Terima Permintaan: Report {year} User {user_id}")
+        logging.info(f"Cek Permintaan: Report {year} User {user_id}")
 
         container = get_container()
+
+        check_query = """
+            SELECT VALUE COUNT(1) 
+            FROM c 
+            WHERE c.type = 'transaction' 
+            AND c.user_id = @user_id 
+            AND c.is_processed = false
+            AND STARTSWITH(c.transaction_date, @year)
+        """
+        check_params = [
+            {"name": "@user_id", "value": str(user_id)},
+            {"name": "@year", "value": year}
+        ]
+
+        # Eksekusi Query Ringan
+        pending_count = list(container.query_items(
+            query=check_query, parameters=check_params, enable_cross_partition_query=True
+        ))[0]
+
+        if pending_count > 0:
+            msg = f"GAGAL: Masih ada {pending_count} transaksi yang belum selesai dikategorikan AI."
+            logging.warning(msg)
+            
+            failure_event = {
+                "id": str(uuid.uuid4()),
+                "subject": f"Report/Generation/Failed/{user_id}",
+                "data": {
+                    "user_id": user_id,
+                    "status": "FAILED",
+                    "reason": "AI_PROCESSING_PENDING",
+                    "message": "Mohon tunggu, AI sedang mengkategorikan transaksi Anda."
+                },
+                "eventType": "ReportGeneration.Failed",
+                "eventTime": datetime.now(timezone.utc).isoformat(),
+                "dataVersion": "1.0"
+            }
+            
+            if not IS_LOCAL_DEMO:
+                client = EventGridPublisherClient(EVENTGRID_ENDPOINT, AzureKeyCredential(EVENTGRID_KEY))
+                client.send([failure_event])
+            
+            return # BERHENTI DI SINI (JANGAN LANJUT GENERATE)
         
-        # Query Transaksi dari Cosmos DB
+        logging.info("✅ Data bersih. Semua transaksi sudah diproses. Lanjut generate...")
+        # ==============================================================================
+
+
+        # 1. Query Data Transaksi (Lanjut proses normal)
         query = "SELECT * FROM c WHERE c.type = 'transaction' AND c.user_id = @user_id"
         params = [{"name": "@user_id", "value": str(user_id)}]
         
@@ -236,7 +282,7 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
         for t in user_trans:
             try:
                 trans_date = datetime.fromisoformat(t["transaction_date"])
-                if str(trans_date.year) == str(year):
+                if str(trans_date.year) == year:
 
                     cat_name = "Uncategorized"
                     cat_type = "Expense"
@@ -257,9 +303,10 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
 
         if not data_list:
             logging.warning("Data kosong.")
+            # Bisa kirim event failed juga disini jika mau
             return
 
-        # Proses Pandas
+        # 2. Proses Pandas
         df = pd.DataFrame(data_list)
         pivot_summary = df.pivot_table(
             index=["Type", "Category"], 
@@ -279,9 +326,9 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
         output.seek(0)
         file_content = output.getvalue()
 
-        # Upload Blob (Tetap pakai Storage Account biasa)
+        # 3. Upload Blob
         if not BLOB_CONN_STR:
-             raise ValueError("AZURE_BLOB_CONN_STR missing for file upload")
+            raise ValueError("AZURE_BLOB_CONN_STR missing for file upload")
 
         blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
         container_name = "reports"
@@ -299,10 +346,8 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
 
         logging.info(f"Upload Sukses: {blob_url}")
 
-        # simpan url ke CosmosDB
+        # 4. Simpan Metadata ke CosmosDB
         try:
-            # Kita menggunakan helper get_container() yang sudah ada di atas
-            # container ini mengarah ke 'fintrackdb' -> 'item'
             report_record = {
                 "id": req_id,
                 "type": "annual_report_file",
@@ -312,21 +357,21 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
                 "status": "COMPLETED",
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
-            
             container.upsert_item(report_record)
             logging.info(f"Metadata laporan disimpan ke Cosmos DB dengan ID: {req_id}")
 
         except Exception as db_error:
             logging.error(f"Gagal menyimpan metadata ke Cosmos DB: {db_error}")
 
-        # Publish Completion Event
+        # 5. Publish Completion Event
         completion_event = {
             "id": str(uuid.uuid4()),
             "subject": f"Report/Generation/Completed/{user_id}",
             "data": {
                 "user_id": user_id,
                 "status": "COMPLETED",
-                "download_url": blob_url
+                "download_url": blob_url,
+                "message": "Laporan tahunan Anda siap diunduh."
             },
             "eventType": "ReportGeneration.Completed",
             "eventTime": datetime.now(timezone.utc).isoformat(),
@@ -343,3 +388,69 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
     except Exception as e:
         logging.error(f"Error PdfGenerator: {e}")
         raise e
+    
+# -----------------------------------------------------------------
+# FUNGSI 5: GetReportStatusFunction (Untuk Polling Frontend)
+# Endpoint: GET /report/status/{request_id}
+# -----------------------------------------------------------------
+@app.route(route="report/status/{request_id}", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def GetReportStatusFunction(req: func.HttpRequest) -> func.HttpResponse:
+    request_id = req.route_params.get('request_id')
+    logging.info(f"Cek status laporan ID: {request_id}")
+
+    if not request_id:
+        return func.HttpResponse(json.dumps({"error": "Request ID missing"}), status_code=400)
+
+    try:
+        container = get_container()
+        
+        # Kita cari dokumen report_file berdasarkan ID request
+        # Asumsi: ID dokumen di Cosmos = Request ID (sesuai kode PdfGenerator kita tadi)
+        query = "SELECT * FROM c WHERE c.id = @id AND (c.type = 'annual_report_file' OR c.type = 'report_file')"
+        params = [{"name": "@id", "value": request_id}]
+        
+        items = list(container.query_items(
+            query=query, parameters=params, enable_cross_partition_query=True
+        ))
+
+        if not items:
+            # Jika belum ada di DB, berarti masih diproses (atau ID salah)
+            # Kita return 202 Accepted (artinya: masih pending/processing)
+            return func.HttpResponse(
+                json.dumps({
+                    "status": "PROCESSING",
+                    "message": "Laporan sedang dibuat..."
+                }),
+                status_code=202, 
+                mimetype="application/json"
+            )
+
+        report = items[0]
+        
+        # Jika statusnya FAILED (karena kena filter AI tadi)
+        if report.get("status") == "FAILED":
+            return func.HttpResponse(
+                json.dumps({
+                    "status": "FAILED",
+                    "reason": report.get("reason"),
+                    "message": report.get("message", "Gagal membuat laporan.")
+                }),
+                status_code=400, # Bad Request (Gagal)
+                mimetype="application/json"
+            )
+
+        # Jika sudah COMPLETED
+        return func.HttpResponse(
+            json.dumps({
+                "status": "COMPLETED",
+                "file_url": report.get("file_url"),
+                "year": report.get("year"),
+                "generated_at": report.get("created_at")
+            }),
+            status_code=200, # OK (Selesai)
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error GetReportStatus: {e}")
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)
