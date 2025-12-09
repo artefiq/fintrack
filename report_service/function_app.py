@@ -426,25 +426,50 @@ def GetReportStatusFunction(req: func.HttpRequest) -> func.HttpResponse:
     if not request_id:
         return func.HttpResponse(json.dumps({"error": "Request ID missing"}), status_code=400)
 
+    # --- 1. VALIDASI TOKEN & AMBIL USER ID ---
+    user_info = _get_user_info_from_token(req)
+    if not user_info:
+        return func.HttpResponse(json.dumps({"error": "Unauthorized"}), status_code=401, mimetype="application/json")
+
+    # Ambil User ID dari Token (Payload Anda pakai 'user_id')
+    current_user_id = user_info.get("user_id")
+    
+    if not current_user_id:
+         return func.HttpResponse(json.dumps({"error": "Invalid Token: user_id missing"}), status_code=401, mimetype="application/json")
+    # -----------------------------------------
+
     try:
         container = get_container()
         
-        # Kita cari dokumen report_file berdasarkan ID request
-        # Asumsi: ID dokumen di Cosmos = Request ID (sesuai kode PdfGenerator kita tadi)
-        query = "SELECT * FROM c WHERE c.id = @id AND (c.type = 'annual_report_file' OR c.type = 'report_file')"
-        params = [{"name": "@id", "value": request_id}]
+        # --- 2. QUERY DENGAN KEAMANAN (FILTER USER_ID) ---
+        # Kita tambahkan AND c.user_id = @user_id
+        # Supaya user A tidak bisa melihat status laporan user B walau tahu ID-nya
+        query = """
+            SELECT * FROM c 
+            WHERE c.id = @id 
+            AND c.user_id = @user_id 
+            AND (c.type = 'annual_report_file' OR c.type = 'report_file')
+        """
+        
+        params = [
+            {"name": "@id", "value": request_id},
+            {"name": "@user_id", "value": current_user_id} # Parameter tambahan
+        ]
         
         items = list(container.query_items(
             query=query, parameters=params, enable_cross_partition_query=True
         ))
 
         if not items:
-            # Jika belum ada di DB, berarti masih diproses (atau ID salah)
-            # Kita return 202 Accepted (artinya: masih pending/processing)
+            # Jika tidak ketemu, bisa jadi:
+            # 1. Memang belum selesai diproses (Processing)
+            # 2. ID salah
+            # 3. ID benar tapi punya orang lain (Security)
+            # Kita return 202 Accepted agar aman & konsisten
             return func.HttpResponse(
                 json.dumps({
                     "status": "PROCESSING",
-                    "message": "Laporan sedang dibuat..."
+                    "message": "Laporan sedang dibuat atau ID tidak ditemukan..."
                 }),
                 status_code=202, 
                 mimetype="application/json"
@@ -452,7 +477,7 @@ def GetReportStatusFunction(req: func.HttpRequest) -> func.HttpResponse:
 
         report = items[0]
         
-        # Jika statusnya FAILED (karena kena filter AI tadi)
+        # Jika statusnya FAILED
         if report.get("status") == "FAILED":
             return func.HttpResponse(
                 json.dumps({
@@ -460,7 +485,7 @@ def GetReportStatusFunction(req: func.HttpRequest) -> func.HttpResponse:
                     "reason": report.get("reason"),
                     "message": report.get("message", "Gagal membuat laporan.")
                 }),
-                status_code=400, # Bad Request (Gagal)
+                status_code=400,
                 mimetype="application/json"
             )
 
@@ -472,13 +497,13 @@ def GetReportStatusFunction(req: func.HttpRequest) -> func.HttpResponse:
                 "year": report.get("year"),
                 "generated_at": report.get("created_at")
             }),
-            status_code=200, # OK (Selesai)
+            status_code=200, 
             mimetype="application/json"
         )
 
     except Exception as e:
         logging.error(f"Error GetReportStatus: {e}")
-        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500, mimetype="application/json")
     
 # -----------------------------------------------------------------
 # FUNGSI 6: GetReportHistoryFunction (Riwayat Laporan)
