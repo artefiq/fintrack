@@ -161,17 +161,18 @@ def process_receipt_ocr(image_url: str, ai_instruction: dict) -> dict:
 
         # 2. GEMINI PROCESSING (Dengan Retry Logic 429)
         cat_result = {}
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Pastikan prompt di process_ai_request meminta return JSON dengan field 'amount'
-                cat_result = process_ai_request(text_for_ai, ai_instruction)
-                break 
-            except Exception as e:
-                if "429" in str(e):
-                    time.sleep(2 ** attempt)
-                else:
-                    break
+        cat_result = process_ai_request(text_for_ai, ai_instruction)
+        logger.info(f"Gemini Categorization Result: {cat_result}")
+        # max_retries = 3
+        # for attempt in range(max_retries):
+        #     try:
+        #         # Pastikan prompt di process_ai_request meminta return JSON dengan field 'amount'
+        #         break 
+        #     except Exception as e:
+        #         if "429" in str(e):
+        #             time.sleep(2 ** attempt)
+        #         else:
+        #             break
 
         # 3. FINAL MERGE
         # Prioritas nilai Amount:
