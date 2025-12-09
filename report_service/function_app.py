@@ -10,6 +10,7 @@ from azure.cosmos import CosmosClient, exceptions
 from azure.storage.blob import BlobServiceClient
 import pandas as pd
 from io import BytesIO
+import jwt
 
 app = func.FunctionApp()
 
@@ -27,6 +28,30 @@ BLOB_CONN_STR = os.getenv("AZURE_BLOB_CONN_STR")
 # 3. Event Grid Config
 EVENTGRID_ENDPOINT = os.getenv("EVENTGRID_TOPIC_ENDPOINT")
 EVENTGRID_KEY = os.getenv("EVENTGRID_ACCESS_KEY")
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET") 
+JWT_ALGORITHM = "HS256"
+
+# --- HELPER: VALIDASI TOKEN MANDIRI ---
+def _get_user_info_from_token(req: func.HttpRequest) -> dict | None:
+    auth_header = req.headers.get('Authorization')
+    if not auth_header:
+        return None
+    try:
+        # Format: "Bearer <token>"
+        token = auth_header.split(' ')[1]
+        
+        # Decode dan validasi signature menggunakan Secret Key yang sama dengan User Service
+        # Kita tidak perlu memanggil User Service, cukup validasi matematik di sini.
+        if not JWT_SECRET_KEY:
+             logging.error("JWT_SECRET missing in configuration")
+             return None
+             
+        decoded = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return decoded
+    except Exception as e:
+        logging.error(f"Token invalid: {e}")
+        return None
 
 # --- HELPER: DB CLIENT ---
 def get_container():
@@ -454,3 +479,63 @@ def GetReportStatusFunction(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error GetReportStatus: {e}")
         return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)
+    
+# -----------------------------------------------------------------
+# FUNGSI 6: GetReportHistoryFunction (Riwayat Laporan)
+# Endpoint: GET /report/history
+# -----------------------------------------------------------------
+@app.route(route="report/history", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def GetReportHistoryFunction(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("Mengambil riwayat laporan user...")
+
+    # 1. Validasi Token (Mandiri)
+    user_info = _get_user_info_from_token(req)
+    if not user_info:
+        return func.HttpResponse(json.dumps({"error": "Unauthorized"}), status_code=401, mimetype="application/json")
+
+    # 2. Ambil User ID dari dalam Token
+    # Token berisi: {"oid": "...", "name": "...", ...}
+    user_id = user_info.get("oid")
+    
+    if not user_id:
+         return func.HttpResponse(json.dumps({"error": "Invalid Token Data"}), status_code=401, mimetype="application/json")
+
+    try:
+        container = get_container() # Helper yang sudah ada (konek ke fintrackdb -> item)
+        
+        # 3. Query Cosmos DB
+        # Cari semua dokumen dengan type='report_file' ATAU 'annual_report_file' milik user ini
+        # Urutkan dari yang terbaru (created_at DESC)
+        query = """
+            SELECT * FROM c 
+            WHERE (c.type = 'annual_report_file' OR c.type = 'report_file') 
+            AND c.user_id = @user_id 
+            ORDER BY c.created_at DESC
+        """
+        params = [{"name": "@user_id", "value": user_id}]
+        
+        items = list(container.query_items(
+            query=query, parameters=params, enable_cross_partition_query=True
+        ))
+
+        # 4. Rapikan Data
+        history = []
+        for item in items:
+            history.append({
+                "request_id": item.get("id"),
+                "year": item.get("year"),
+                "status": item.get("status"), # PROCESSING / COMPLETED / FAILED
+                "file_url": item.get("file_url"), # None jika belum selesai
+                "created_at": item.get("created_at"),
+                "message": item.get("message")
+            })
+
+        return func.HttpResponse(
+            json.dumps({"data": history}),
+            status_code=200, 
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error GetHistory: {e}")
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500, mimetype="application/json")
