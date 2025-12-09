@@ -3,6 +3,8 @@ import logging
 import json
 import uuid
 import os
+import hashlib
+import jwt # Pastikan library PyJWT terinstall
 from datetime import datetime
 import reverse_geocoder as rg
 from azure.cosmos import CosmosClient
@@ -17,10 +19,39 @@ CONTAINER_NAME = os.environ.get("COSMOS_CONTAINER_NAME")
 OUTPUT_QUEUE_NAME = os.environ.get("STORAGE_QUEUE_NAME")
 BLOB_CONTAINER_NAME = "receipt-images"
 
+# Konfigurasi JWT
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET")
+JWT_ALGORITHM = "HS256"
+
 # Inisialisasi Function App (V2 Model)
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
+# --- HELPER FUNCTIONS ---
+
+def _get_user_info_from_token(req: func.HttpRequest) -> dict | None:
+    """
+    Validasi Token JWT dan return payloadnya.
+    """
+    auth_header = req.headers.get('Authorization')
+    if not auth_header:
+        return None
+    
+    try:
+        parts = auth_header.split(' ')
+        if len(parts) != 2 or parts[0].lower() != 'bearer':
+            return None
+        
+        token = parts[1]
+        decoded = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return decoded
+    except Exception as e:
+        logging.error(f"Token invalid: {e}")
+        return None
+
 def upload_image_to_blob(file, filename):
+    """
+    Upload file gambar ke Azure Blob Storage
+    """
     try:
         blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONN_STR)
         container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
@@ -35,10 +66,19 @@ def upload_image_to_blob(file, filename):
         logging.error(f"Error uploading blob: {e}")
         return None
 
-# PERHATIKAN: Decorator ini yang mendaftarkan fungsi ke Azure
+# --- MAIN FUNCTIONS ---
+
 @app.route(route="transaction/create", methods=["POST"])
 def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Processing Create Transaction request (V2 Model).')
+    logging.info('Processing Create Transaction request.')
+
+    # --- 1. JWT SECURITY CHECK (BARU) ---
+    user_info = _get_user_info_from_token(req)
+    if not user_info:
+        return func.HttpResponse(json.dumps({"error": "Unauthorized: Invalid or Missing Token"}), status_code=401)
+
+    # Optional: Kamu bisa memaksa user_id diambil dari token, bukan dari body
+    # user_id_from_token = user_info.get("user_id")
 
     try:
         content_type = req.headers.get("Content-Type", "")
@@ -52,7 +92,7 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
         input_type = "text"
         source = "manual_input"
 
-        # --- 1. Parsing Logic ---
+        # 2. Parsing Input
         if "application/json" in content_type:
             try:
                 req_body = req.get_json()
@@ -84,11 +124,11 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
                 else:
                     return func.HttpResponse(json.dumps({"error": "Blob upload failed"}), status_code=500)
 
-        # --- 2. Validasi ---
+        # 3. Validasi Minimal
         if not user_id:
             return func.HttpResponse(json.dumps({"error": "Missing user_id"}), status_code=400)
 
-        # --- 3. Reverse Geocoding ---
+        # 4. Reverse Geocoding
         location_obj = {"city": "Unknown", "country": "Unknown"}
         if lat and lon:
             try:
@@ -97,7 +137,7 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
             except Exception:
                 pass
 
-        # --- 4. Prepare Document ---
+        # 5. Prepare Document
         transaction_id = str(uuid.uuid4())
         document = {
             "id": transaction_id,
@@ -114,13 +154,13 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
             "is_processed": False
         }
 
-        # --- 5. Save to Cosmos DB ---
+        # 6. Save to Cosmos DB
         client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
         database = client.get_database_client(DATABASE_NAME)
         container = database.get_container_client(CONTAINER_NAME)
         container.create_item(body=document)
 
-        # --- 6. Send to Queue ---
+        # 7. Send to Queue
         queue_client = QueueClient.from_connection_string(STORAGE_CONN_STR, OUTPUT_QUEUE_NAME)
         try:
             queue_client.send_message(json.dumps(document))
@@ -133,39 +173,123 @@ def CreateTransaction(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Error: {str(e)}")
         return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)
-    
-    
+
+
 @app.route(route="transaction/get", methods=["GET"])
 def GetTransaction(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Getting transaction detail.')
     
-    # Ambil parameter dari Query String (?id=...&user_id=...)
-    # user_id WAJIB karena dia adalah Partition Key Cosmos DB Anda
+    # --- 1. JWT SECURITY CHECK (BARU) ---
+    user_info = _get_user_info_from_token(req)
+    if not user_info:
+        return func.HttpResponse(json.dumps({"error": "Unauthorized: Invalid or Missing Token"}), status_code=401)
+
     doc_id = req.params.get('id')
     user_id = req.params.get('user_id')
 
     if not doc_id or not user_id:
-        return func.HttpResponse(
-            json.dumps({"error": "Please provide id and user_id"}),
-            status_code=400
-        )
+        return func.HttpResponse(json.dumps({"error": "Please provide id and user_id"}), status_code=400)
 
     try:
         client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
         database = client.get_database_client(DATABASE_NAME)
         container = database.get_container_client(CONTAINER_NAME)
 
-        # Baca Item dari Cosmos DB
-        # read_item butuh ID dan Partition Key
         item = container.read_item(item=doc_id, partition_key=user_id)
         
+        return func.HttpResponse(json.dumps(item), status_code=200, mimetype="application/json")
+    except Exception as e:
+        return func.HttpResponse(json.dumps({"error": "Transaction not found or error"}), status_code=404)
+
+
+@app.route(route="admin/dataset/json", methods=["GET"])
+def AdminDashboardData(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Fetching Admin Dashboard Data (JSON) with Filters.')
+
+    # --- 1. JWT SECURITY CHECK ---
+    user_info = _get_user_info_from_token(req)
+
+    if not user_info:
+        return func.HttpResponse(json.dumps({"error": "Unauthorized or Invalid Token"}), status_code=401)
+    
+    if user_info.get("role") != "admin":
+        return func.HttpResponse(json.dumps({"error": "Access Denied: Admins only"}), status_code=403)
+
+    # --- 2. AMBIL PARAMETER FILTER ---
+    start_date = req.params.get('start_date') 
+    end_date = req.params.get('end_date')      
+    category_filter = req.params.get('category') 
+
+    try:
+        client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
+        container = client.get_database_client(DATABASE_NAME).get_container_client(CONTAINER_NAME)
+
+        # --- 3. BANGUN QUERY DINAMIS ---
+        query = "SELECT * FROM c WHERE 1=1"
+        parameters = []
+
+        if start_date and end_date:
+            query += " AND c.transaction_date >= @start AND c.transaction_date <= @end"
+            parameters.append({"name": "@start", "value": f"{start_date}T00:00:00"})
+            parameters.append({"name": "@end", "value": f"{end_date}T23:59:59"})
+
+        if category_filter:
+            query += " AND c.category.name = @category"
+            parameters.append({"name": "@category", "value": category_filter})
+
+        items = list(container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        # --- 4. DATA PROCESSING & ANONYMIZATION ---
+        dashboard_data = []
+        
+        for item in items:
+            raw_user_id = item.get("user_id", "unknown")
+            hashed_user = hashlib.sha256(raw_user_id.encode()).hexdigest()[:8]
+
+            trx_date_str = item.get("transaction_date", "")
+            try:
+                dt_obj = datetime.fromisoformat(trx_date_str)
+                iso_date = dt_obj.isoformat() 
+                hour_val = dt_obj.hour
+                day_val = dt_obj.strftime("%A")
+            except:
+                iso_date = trx_date_str
+                hour_val = 0
+                day_val = "Unknown"
+
+            dashboard_data.append({
+                "id": item.get("id"),
+                "user_hash": hashed_user,
+                "date_full": iso_date,
+                "day_name": day_val,
+                "hour": hour_val,
+                "amount": item.get("amount", 0),
+                "description": item.get("description", ""),
+                "category": item.get("category", {}).get("name", "Uncategorized"),
+                "type": item.get("category", {}).get("category_type", "Expense"),
+                "city": item.get("location", {}).get("city", "Unknown"),
+                "source": item.get("source", "manual")
+            })
+
         return func.HttpResponse(
-            json.dumps(item),
+            body=json.dumps({
+                "message": "Data fetched successfully",
+                "filters_applied": {
+                    "start": start_date,
+                    "end": end_date,
+                    "category": category_filter
+                },
+                "total_rows": len(dashboard_data),
+                "data": dashboard_data
+            }),
             status_code=200,
             mimetype="application/json"
         )
+
     except Exception as e:
-        return func.HttpResponse(
-            json.dumps({"error": "Transaction not found or error"}),
-            status_code=404
-        )
+        logging.error(f"Dashboard Data Error: {str(e)}")
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)
