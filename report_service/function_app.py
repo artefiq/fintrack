@@ -271,6 +271,23 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
             msg = f"GAGAL: Masih ada {pending_count} transaksi yang belum selesai dikategorikan AI."
             logging.warning(msg)
             
+            try:
+                fail_record = {
+                    "id": req_id,
+                    "type": "annual_report_file",
+                    "user_id": user_id,
+                    "year": year,
+                    "status": "FAILED",
+                    "reason": "AI_PROCESSING_PENDING",
+                    "message": "Mohon tunggu, AI sedang mengkategorikan transaksi Anda.",
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+                container.upsert_item(fail_record)
+                logging.info(f"Status FAILED disimpan ke DB untuk Request ID: {req_id}")
+            except Exception as db_e:
+                logging.error(f"Gagal simpan status failed ke DB: {db_e}")
+            
+            # Kirim Event
             failure_event = {
                 "id": str(uuid.uuid4()),
                 "subject": f"Report/Generation/Failed/{user_id}",
@@ -289,7 +306,7 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
                 client = EventGridPublisherClient(EVENTGRID_ENDPOINT, AzureKeyCredential(EVENTGRID_KEY))
                 client.send([failure_event])
             
-            return # BERHENTI DI SINI (JANGAN LANJUT GENERATE)
+            return # BERHENTI DI SINI
         
         logging.info("✅ Data bersih. Semua transaksi sudah diproses. Lanjut generate...")
         # ==============================================================================
@@ -328,11 +345,24 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
 
         if not data_list:
             logging.warning("Data kosong.")
-            # Bisa kirim event failed juga disini jika mau
             return
 
-        # 2. Proses Pandas
+        # 2. Proses Pandas & Hitung Total
         df = pd.DataFrame(data_list)
+        
+        # --- HITUNG TOTAL (Baru) ---
+        total_income = df[df['Type'] == 'Income']['Amount'].sum()
+        total_expense = df[df['Type'] == 'Expense']['Amount'].sum()
+        net_savings = total_income - total_expense
+        
+        # Buat DataFrame Ringkasan untuk Sheet 'Overview'
+        overview_data = {
+            "Metric": ["Total Pemasukan (Income)", "Total Pengeluaran (Expense)", "Sisa Saldo (Savings)"],
+            "Amount": [total_income, total_expense, net_savings]
+        }
+        df_overview = pd.DataFrame(overview_data)
+        
+        # Pivot Table (Per Kategori)
         pivot_summary = df.pivot_table(
             index=["Type", "Category"], 
             values="Amount", 
@@ -341,12 +371,22 @@ def PdfGeneratorFunction(event: func.EventGridEvent):
         
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Transactions', index=False)
+            # Sheet 1: Overview (Paling penting)
+            df_overview.to_excel(writer, sheet_name='Overview', index=False)
+            
+            # Sheet 2: Summary (Per Kategori)
             pivot_summary.to_excel(writer, sheet_name='Summary')
+            
+            # Sheet 3: Raw Data
+            df.to_excel(writer, sheet_name='Transactions', index=False)
 
+            # Auto-adjust column width (Opsional, untuk kerapian)
             for sheet in writer.sheets.values():
                 for column in sheet.columns:
-                    sheet.column_dimensions[column[0].column_letter].width = 20
+                    try:
+                        sheet.column_dimensions[column[0].column_letter].width = 25
+                    except:
+                        pass
         
         output.seek(0)
         file_content = output.getvalue()
