@@ -231,7 +231,7 @@ def GetUserTransactions(req: func.HttpRequest) -> func.HttpResponse:
     if not user_info:
         return func.HttpResponse(json.dumps({"error": "Unauthorized"}), status_code=401)
 
-    # Ambil user_id dari token (Biar user cuma bisa liat datanya sendiri)
+    # Ambil user_id dari token
     user_id = user_info.get("user_id")
     if not user_id:
          return func.HttpResponse(json.dumps({"error": "Invalid Token"}), status_code=401)
@@ -240,10 +240,15 @@ def GetUserTransactions(req: func.HttpRequest) -> func.HttpResponse:
         client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
         container = client.get_database_client(DATABASE_NAME).get_container_client(CONTAINER_NAME)
 
-        # --- 2. QUERY COSMOS DB ---
-        # Ambil semua data milik user_id ini
-        # Diurutkan dari yang paling baru (DESC)
-        query = "SELECT * FROM c WHERE c.user_id = @userId ORDER BY c.transaction_date DESC"
+        # --- 2. QUERY COSMOS DB (UPDATED) ---
+        # Filter: user_id AND type='transaction'
+        # Sort: transaction_date DESC (Terbaru diatas)
+        query = """
+            SELECT * FROM c 
+            WHERE c.user_id = @userId 
+            AND c.type = 'transaction' 
+            ORDER BY c.transaction_date DESC
+        """
         
         parameters = [
             {"name": "@userId", "value": user_id}
@@ -253,11 +258,10 @@ def GetUserTransactions(req: func.HttpRequest) -> func.HttpResponse:
         items = list(container.query_items(
             query=query,
             parameters=parameters,
-            enable_cross_partition_query=False # False karena kita query di satu partisi (user_id)
+            enable_cross_partition_query=False 
         ))
 
-        # --- 3. DATA PROCESSING (Opsional) ---
-        # Kita rapikan sedikit formatnya biar enak dibaca Frontend
+        # --- 3. DATA PROCESSING ---
         history_data = []
         for item in items:
             history_data.append({
@@ -267,7 +271,8 @@ def GetUserTransactions(req: func.HttpRequest) -> func.HttpResponse:
                 "date": item.get("transaction_date"),
                 "category": item.get("category", {}).get("name", "Pending"),
                 "is_processed": item.get("is_processed", False),
-                "image_url": item.get("image_url") # Biar bisa liat struknya lagi
+                "image_url": item.get("image_url"),
+                "source": item.get("source", "manual") # Tambahin source biar lengkap
             })
 
         return func.HttpResponse(
