@@ -127,7 +127,6 @@ def RequestReportGeneration(req: func.HttpRequest) -> func.HttpResponse:
 
 # ---------------------------------------------------------------------------
 # 2. FUNGSI UMUM: API Gateway Proxy
-# PERBAIKAN: auth_level=func.AuthLevel.ANONYMOUS (Agar tidak 401)
 # ---------------------------------------------------------------------------
 @app.route(route="gateway/{*path}", methods=["GET", "POST", "PUT", "DELETE"], auth_level=func.AuthLevel.ANONYMOUS)
 def gateway(req: func.HttpRequest) -> func.HttpResponse:
@@ -137,86 +136,91 @@ def gateway(req: func.HttpRequest) -> func.HttpResponse:
         
         logging.info(f"Gateway proxying request to: {path}")
 
-        # --- SECURITY CHECK ---
-        # Tentukan endpoint mana yang boleh diakses publik (tanpa token)
+        # --- 1. SECURITY CHECK (FRONTEND) ---
+        # Masukkan endpoint AI ke sini agar lolos pengecekan token
         public_endpoints = [
             "user/login",
             "user/register",
-            "ai/language" # Mungkin AI juga butuh token, tapi kita buka dulu untuk demo
+            "ai/language",
+            "ai/ocr"
         ]
         
-        # Jika path BUKAN public, kita wajib cek token
+        # Cek Token HANYA JIKA path tidak ada di daftar public
         if path not in public_endpoints:
-            # Panggil helper validasi yang sudah kita buat
-            # Helper ini akan decode token dan cek expiry
             user_info = _get_user_info_from_token(req)
-            
             if not user_info:
-                # Jika token tidak ada atau tidak valid -> TOLAK DI PINTU DEPAN
                 return func.HttpResponse(
                     json.dumps({"error": "Unauthorized. Please login first."}), 
                     status_code=401, 
                     mimetype="application/json"
                 )
             
-            # (Opsional) Kita bisa menyuntikkan user_id ke header agar service belakang tahu
-            # req.headers["X-User-Id"] = user_info.get("user_id")
-        # ----------------------
+            # (Opsional) Inject User ID ke Header untuk service lain
+            # req.headers["x-user-id"] = user_info.get("user_id")
+        # ------------------------------------
 
-        target = None
+        # --- 2. TENTUKAN TARGET & SISIPKAN BACKEND KEY ---
+        target_host = None
+        backend_key = None 
+
         if path.startswith("user"):
-            target = os.getenv("USER_SERVICE_URL")
+            target_host = os.getenv("USER_SERVICE_URL")
         elif path.startswith("transaction"):
-            target = os.getenv("TRANSACTION_SERVICE_URL")
+            target_host = os.getenv("TRANSACTION_SERVICE_URL")
+            backend_key = os.getenv("TRANSACTION_SERVICE_KEY") 
         elif path.startswith("category"):
-            target = os.getenv("CATEGORY_SERVICE_URL")
+            target_host = os.getenv("CATEGORY_SERVICE_URL")
         elif path.startswith("ai"):
-            target = os.getenv("AI_SERVICE_URL")
+            target_host = os.getenv("AI_SERVICE_URL")
+            # Gateway tetap wajib bawa kunci ini ke Backend AI
+            backend_key = os.getenv("AI_SERVICE_KEY") 
         elif path.startswith("report"): 
-            target = os.getenv("REPORT_SERVICE_URL")
+            target_host = os.getenv("REPORT_SERVICE_URL")
         else:
-            return func.HttpResponse(
-                json.dumps({"error": "Unknown service path"}),
-                mimetype="application/json",
-                status_code=404
-            )
+            return func.HttpResponse(json.dumps({"error": "Unknown path"}), status_code=404)
 
-        if not target:
-            return func.HttpResponse(
-                json.dumps({"error": "Service URL configuration missing"}),
-                status_code=500,
-                mimetype="application/json"
-            )
+        if not target_host:
+            return func.HttpResponse(json.dumps({"error": "Service configuration missing"}), status_code=500)
 
-        fwd_headers = {key: value for (key, value) in req.headers.items() if key.lower() != 'host'}
-        target_url = f"{target}/{path}"
+        target_url = f"{target_host.rstrip('/')}/{path}"
+
+        # --- 3. SIAPKAN REQUEST ---
         
-        req_body = None
+        # A. Headers
+        fwd_headers = {
+            k: v for k, v in req.headers.items() 
+            if k.lower() not in ['host', 'content-length']
+        }
+
+        # B. Inject Function Key (Agar Backend AI mau menerima request dari Gateway)
+        if backend_key:
+            fwd_headers['x-functions-key'] = backend_key
+
+        # C. Body (Aman untuk JSON & Multipart/File)
         try:
             req_body = req.get_body()
         except:
-            pass
+            req_body = None
 
+        # --- 4. KIRIM REQUEST KE BACKEND ---
         resp = requests.request(
             method=method,
             url=target_url,
             headers=fwd_headers,
-            data=req_body
+            data=req_body,
+            params=req.params 
         )
         
+        # --- 5. KEMBALIKAN RESPONSE ---
         return func.HttpResponse(
             resp.content,
-            mimetype=resp.headers.get('Content-Type', 'application/json'),
-            status_code=resp.status_code
+            status_code=resp.status_code,
+            mimetype=resp.headers.get('Content-Type', 'application/json')
         )
 
     except Exception as e:
         logging.error(f"Gateway Error: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": f"Gateway Error: {str(e)}"}),
-            mimetype="application/json",
-            status_code=500
-        )
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500)
     
 # ---------------------------------------------------------------------------
 # 3. FUNGSI KHUSUS: Cek Status Laporan (Untuk Polling)

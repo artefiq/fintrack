@@ -2,3 +2,5 @@ azure-functions
 requests
 azure-eventgrid
 azure-core
+requests
+PyJWT
