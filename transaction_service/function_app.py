@@ -276,7 +276,7 @@ def GetUserTransactions(req: func.HttpRequest) -> func.HttpResponse:
                 "location": item.get("location", {}), 
                 "category": item.get("category", {}), 
                 
-                "source": item.get("source", "manual"),
+                "source": item.get("source", "cash"),
                 "input_type": item.get("input_type", "text"),
                 "is_processed": item.get("is_processed", False),
                 "ai_confidence": item.get("ai_confidence") # Tambahan data dari AI
