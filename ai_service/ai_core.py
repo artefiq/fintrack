@@ -156,6 +156,15 @@ def process_receipt_ocr(image_url: str, ai_instruction: dict) -> dict:
             ---
             {raw_full_text}
             ---
+            RULES PENTING UNTUK EKSTRAKSI AMOUNT:
+            1. Struk adalah format indonesia.
+            2. Simbol titik (.) adalah PEMISAH RIBUAN, BUKAN titik desimal.
+            - Contoh: "66.900" artinya 66900.
+            - Contoh: "1.500" artinya 1500.
+            3. RETURN 'amount' SEBAGAI NUMBER ASLI (INTEGER/FLOAT) TANPA SEPARATOR ANEH.
+            - WRONG: 66.900
+            - WRONG: 66,900
+            - CORRECT: 66900
             """
             logger.warning("Azure Fields Incomplete/Zero. Sending RAW CONTENT to Gemini.")
 
