@@ -240,7 +240,7 @@ def GetUserTransactions(req: func.HttpRequest) -> func.HttpResponse:
         client = CosmosClient.from_connection_string(COSMOS_CONN_STR)
         container = client.get_database_client(DATABASE_NAME).get_container_client(CONTAINER_NAME)
 
-        # --- 2. QUERY COSMOS DB (UPDATED) ---
+        # --- 2. QUERY COSMOS DB ---
         # Filter: user_id AND type='transaction'
         # Sort: transaction_date DESC (Terbaru diatas)
         query = """
@@ -261,18 +261,25 @@ def GetUserTransactions(req: func.HttpRequest) -> func.HttpResponse:
             enable_cross_partition_query=False 
         ))
 
-        # --- 3. DATA PROCESSING ---
+        # --- 3. DATA PROCESSING (LENGKAP) ---
         history_data = []
         for item in items:
             history_data.append({
                 "id": item.get("id"),
-                "description": item.get("description"),
+                "type": item.get("type"), # transaction
                 "amount": item.get("amount", 0),
-                "date": item.get("transaction_date"),
-                "category": item.get("category", {}).get("name", "Pending"),
-                "is_processed": item.get("is_processed", False),
+                "description": item.get("description"),
+                "transaction_date": item.get("transaction_date"),
                 "image_url": item.get("image_url"),
-                "source": item.get("source", "manual") # Tambahin source biar lengkap
+                
+                # Objek Nested (Location & Category) dikirim utuh
+                "location": item.get("location", {}), 
+                "category": item.get("category", {}), 
+                
+                "source": item.get("source", "manual"),
+                "input_type": item.get("input_type", "text"),
+                "is_processed": item.get("is_processed", False),
+                "ai_confidence": item.get("ai_confidence") # Tambahan data dari AI
             })
 
         return func.HttpResponse(
